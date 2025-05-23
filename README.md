@@ -40,7 +40,8 @@ urine-strip-analyzer/
 ## **Setup Instructions**
 
 > **Note:** Your trained model file (`pod_segmentation_scriptedV3.pt`) is **over 100MB** and cannot be pushed to GitHub.  
-> **Recommended approach:** Upload the model to [Google Drive](https://drive.google.com), [Dropbox](https://dropbox.com), or similar, and provide a download link in this README.
+> **Download the model from the link below and place it in `app/model/`:**  
+> **[Download model from Google Drive](https://drive.google.com/file/d/1Y_hBEldKNbi-UdaIAgdm8SsfBqNoScO-/view?usp=drive_link)**
 
 ### 1. Clone the Repository
 
@@ -66,11 +67,9 @@ pip install -r requirements.txt
 
 ### 3. Download the Model File
 
-- Download the model file (`pod_segmentation_scriptedV3.pt`) from the link below and place it in `app/model/`:
-
-  **[Download model from Google Drive](https://your-link-here)**
-  
-  *(Replace this link with your actual file sharing link!)*
+- Download the model file (`pod_segmentation_scriptedV3.pt`) from:  
+  **[Download model from Google Drive](https://drive.google.com/file/d/1Y_hBEldKNbi-UdaIAgdm8SsfBqNoScO-/view?usp=drive_link)**
+- Place it in `app/model/`.
 
 ---
 
