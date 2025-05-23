@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Urine Strip Analyzer</title>
+
+  <!-- Bootstrap 5 CSS for styling and responsive layout -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+
+  <!-- Custom styling for layout, fonts, and containers -->
+  <style>
+    body {
+      background-color: #f5f7fa;
+      font-family: 'Segoe UI', sans-serif;
+      padding-top: 40px;
+    }
+
+    .container {
+      max-width: 900px;
+    }
+
+    h1 {
+      font-weight: 700;
+      font-size: 2rem;
+    }
+
+    h4 {
+      font-weight: 600;
+      font-size: 1.3rem;
+    }
+
+    .footer {
+      margin-top: 30px;
+      text-align: center;
+      font-size: 0.85rem;
+      color: #777;
+    }
+
+    .image-container {
+      text-align: center;
+    }
+
+    .image-container img {
+      max-height: 320px;
+      max-width: 100%;
+      border-radius: 8px;
+      border: 1px solid #ccc;
+    }
+
+    .btn-download {
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <!-- Page Title -->
+  <h1 class="text-center mb-4">Urine Strip Pod Analyzer</h1>
+
+  <!-- ──────────────── Upload Form ──────────────── -->
+  <div class="card p-4 shadow-sm mb-4">
+    <form method="POST" enctype="multipart/form-data">
+      <div class="mb-3">
+        <label class="form-label">Upload Strip Image (.jpg or .png)</label>
+        <!-- File input for uploading image -->
+        <input class="form-control" type="file" name="image" accept="image/*" required>
+      </div>
+      <!-- Submit button -->
+      <button class="btn btn-primary" type="submit">Upload & Analyze</button>
+    </form>
+  </div>
+
+  <!-- ──────────────── Composite Summary ──────────────── -->
+  {% if image_name %}
+  <div class="card p-4 shadow-sm mb-4">
+    <h4 class="mb-3 text-center">Composite Summary</h4>
+
+    <div class="image-container">
+      <!-- Display the generated composite image with color patches -->
+      <img src="{{ url_for('static', filename='uploads/' + result.composite_img) }}" alt="Composite Summary Image">
+
+      <!-- Download button for the composite summary -->
+      <div class="btn-download">
+        <a href="{{ url_for('static', filename='uploads/' + result.composite_img) }}" download class="btn btn-sm btn-outline-secondary">Download Summary</a>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Footer with credits -->
+  <div class="footer">
+    Powered by Flask + TorchScript
+</div>
+
+<!-- Bootstrap 5 JS bundle for any interactive elements -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

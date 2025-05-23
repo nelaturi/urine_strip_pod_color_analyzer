@@ -1,0 +1,14 @@
+app/model/pod_segmentation_scriptedV3.pt 
+app/static/uploads/ 
+dist/ 
+build/ 
+*.spec 
+*.exe 
+__pycache__/ 
+*.pyc 
+.DS_Store 
+.env 
+*.env 
+*.swp 
+.idea/ 
+.vscode/ 
