@@ -39,7 +39,6 @@ urine-strip-analyzer/
 
 ## **Setup Instructions**
 
-> **Note:** Your trained model file (`pod_segmentation_scriptedV3.pt`) is **over 100MB** and cannot be pushed to GitHub.  
 > **Download the model from the link below and place it in `app/model/`:**  
 > **[Download model from Google Drive](https://drive.google.com/file/d/1Y_hBEldKNbi-UdaIAgdm8SsfBqNoScO-/view?usp=drive_link)**
 
@@ -109,33 +108,9 @@ python run.py
 
 ---
 
-## **Notes and Recommendations**
-
-- **Model file not in repo**: Due to GitHub file size limits, the model binary is NOT tracked by Git. Use a cloud link as described.
-- **.gitignore**: Add `app/model/pod_segmentation_scriptedV3.pt` and `app/static/uploads/` to your `.gitignore` to avoid pushing large or auto-generated files.
-
-Example `.gitignore`:
-```
-# Model binary
-app/model/pod_segmentation_scriptedV3.pt
-
-# Uploaded & output images
-app/static/uploads/
-```
-
-- **Production deployment**: For public use, consider using Gunicorn or a cloud host like Render, Heroku, or AWS.
-- **License**: Add license terms if required.
-
----
-
-## **Contact**
-
-For any queries, reach out at [your.email@example.com] or create an issue in this repository.
-
----
 
 ## **Credits**
 
-- Developed by [Your Name]
+- Developed by Naresh
 - Powered by Flask, PyTorch, Albumentations, and Bootstrap.
 
