@@ -45,7 +45,7 @@ urine-strip-analyzer/
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/urine-strip-analyzer.git
+git clone https://github.com/nelaturi/urine_strip_colour_identification.git
 cd urine-strip-analyzer
 ```
 
@@ -61,8 +61,6 @@ Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
-
-**(Or, if you use `environment.yml`, run `conda env create -f environment.yml`)**
 
 ### 3. Download the Model File
 
