@@ -18,7 +18,7 @@ A Flask web application powered by a deep learning model to identify and analyze
 ## Folder Structure
 
 ```
-urine_strip_colour_identification/
+urine_strip_pod_color_analyzer/
 │
 ├── app/
 │   ├── __init__.py
