@@ -45,8 +45,8 @@ urine_strip_colour_identification/
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/nelaturi/urine_strip_colour_identification.git
-cd urine_strip_colour_identification
+git clone https://github.com/nelaturi/urine_strip_pod_color_analyzer.git
+cd urine_strip_pod_color_analyzer
 ```
 
 ### 2. Setup Environment (Anaconda Recommended)
