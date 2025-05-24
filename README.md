@@ -18,7 +18,7 @@ A Flask web application powered by a deep learning model to identify and analyze
 ## Folder Structure
 
 ```
-urine-strip-analyzer/
+urine_strip_colour_identification/
 │
 ├── app/
 │   ├── __init__.py
@@ -46,7 +46,7 @@ urine-strip-analyzer/
 
 ```bash
 git clone https://github.com/nelaturi/urine_strip_colour_identification.git
-cd urine-strip-analyzer
+cd urine_strip_colour_identification
 ```
 
 ### 2. Setup Environment (Anaconda Recommended)
