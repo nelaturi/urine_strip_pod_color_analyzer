@@ -1,19 +1,23 @@
 
 # Urine Strip Pod Color Analyzer
 
-A Flask web application powered by a deep learning model to identify and analyze the color of pods in urine test strips. The system automatically detects Creatinine and Microalbumin pods in uploaded strip images and generates an easy-to-interpret composite summary of pod colors, mapped to clinical color codes.
+A Flask web application powered by a deep learning model to identify and analyze the color of pods in urine test strips. The system automatically detects Creatinine and Microalbumin pods in uploaded strip images.
 
----
+**Key Enhancements in this Version:**
+* **Calibrated Clinical Values:** Incorporates specialized regression models for Creatinine and Microalbumin. These models refine the predicted clinical values from the detected pod colors, resulting in significantly higher accuracy compared to direct color-to-value mapping. The displayed values are then intelligently "snapped" to the closest standard value from the clinical reference chart for clarity.
+* **Raw Image in Composite Summary:** For enhanced context and visual comparison, the original uploaded urine test strip image is now displayed directly within the composite summary output, alongside the analyzed Creatinine and Microalbumin pods.
+* **Improved User Interface:** While maintaining the original minimalist layout, the visual output now provides more precise information directly on the composite image.
+
+The system generates an easy-to-interpret composite summary showing the raw input, detected pod colors, calibrated clinical values, and RGB codes.
 
 ## Features
 
-- Upload a urine test strip image and get instant pod color identification.
-- Visual composite summary: Shows color patches, clinical values, and RGB codes for each pod.
-- Simple, user-friendly web interface.
-- Downloadable results for record-keeping or clinical use.
-- TorchScript-powered backend for fast inference.
-
----
+* Upload a urine test strip image and get instant pod color identification.
+* Visual composite summary: Shows the **original uploaded image**, color patches for Creatinine and Microalbumin, **calibrated clinical values (snapped to reference labels)**, and RGB codes for each detected pod.
+* Simple, user-friendly web interface.
+* Downloadable results for record-keeping or clinical use.
+* TorchScript-powered segmentation backend for fast inference.
+* `joblib`-serialized regression models for accurate clinical value calibration.
 
 ## Folder Structure
 
@@ -26,8 +30,10 @@ urine_strip_pod_color_analyzer/
 │   ├── utils.py
 │   ├── model/
 │   │   └── pod_segmentation_scriptedV3.pt  # [Not on GitHub - see instructions]
+│   │   └── creatinine_model.pkl          # [Not on GitHub - see instructions]
+│   │   └── microalbumin_model.pkl        # [Not on GitHub - see instructions]
 │   ├── static/
-│   │   └── uploads/        # Stores uploaded images & output
+│   │   └── uploads/        # Stores uploaded images & Generated Composite Outputs
 │   └── templates/
 │       └── index.html
 ├── run.py
@@ -39,8 +45,8 @@ urine_strip_pod_color_analyzer/
 
 ## **Setup Instructions**
 
-> **Download the model from the link below and place it in `app/model/`:**  
-> **[Download model from Google Drive](https://drive.google.com/file/d/1Y_hBEldKNbi-UdaIAgdm8SsfBqNoScO-/view?usp=drive_link)**
+> **Download the models from the link below and place it in `app/model/`:**  
+> **[Download models from Google Drive] --> https://drive.google.com/drive/folders/1-Gg3kdMehKUKgHVt3BC8C9UD2c6oqciS?usp=sharing**
 
 ### 1. Clone the Repository
 
@@ -62,10 +68,10 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-### 3. Download the Model File
+### 3. Download the Model Files
 
-- Download the model file (`pod_segmentation_scriptedV3.pt`) from:  
-  **[Download model from Google Drive](https://drive.google.com/file/d/1Y_hBEldKNbi-UdaIAgdm8SsfBqNoScO-/view?usp=drive_link)**
+- Download the model files ('pod_segmentation_scriptedV3.pt', 'creatinine_model.pkl', 'microalbumin_model.pkl') from:  
+  **[Download model from Google Drive] --> https://drive.google.com/drive/folders/1-Gg3kdMehKUKgHVt3BC8C9UD2c6oqciS?usp=sharing**
 - Place it in `app/model/`.
 
 ---
@@ -100,15 +106,20 @@ python run.py
 
 ## **Model & Data**
 
-- **Model**: TorchScript-serialized segmentation model trained to identify and classify pod regions in urine strip images.
-- **Input**: `.jpg` or `.png` images of urine test strips.
-- **Output**: Composite summary image with clinical mapping for each pod.
+* **Segmentation Model**: A TorchScript-serialized deep learning model, trained to accurately identify and segment the Creatinine and Microalbumin pod regions within urine strip images.
+* **Calibrated Prediction Models**: Two separate `joblib`-serialized regression models (one for Creatinine, one for Microalbumin) that take multi-channel color features (RGB, HSV, Lab) extracted from the detected pods as input. These models predict a more accurate, continuous clinical value. For display, these continuous values are then "snapped" to the nearest predefined discrete value on the official reference chart to provide clinically relevant interpretations.
+* **Input**: Standard `.jpg` or `.png` images of urine test strips.
+* **Output**: A composite summary image visually presenting:
+    * The **original uploaded urine strip image**.
+    * Color patches representing the average color of the detected Creatinine and Microalbumin pods.
+    * The **calibrated clinical value** (mapped to the closest reference chart label).
+    * The mean RGB color code for each pod.
 
 ---
 
 
 ## **Credits**
 
-- Developed by Naresh
+- Developed by Naresh Nelaturi
 - Powered by Flask, PyTorch, Albumentations, and Bootstrap.
 
