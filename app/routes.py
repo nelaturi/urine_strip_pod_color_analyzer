@@ -2,14 +2,13 @@ import os
 import sys
 import torch
 import numpy as np
-from flask import Blueprint, render_template, request
-from PIL import Image
+from flask import Blueprint, render_template, request, url_for
+import uuid
 from .utils import process_image_and_get_pods
 
 # ───────────────────────────────
 # Create Flask Blueprint
 # ───────────────────────────────
-# This allows modular separation of routes from the main app
 main = Blueprint("main", __name__)
 
 # ───────────────────────────────
@@ -21,24 +20,24 @@ def resource_path(relative_path):
     compatible with both local development and packaged .exe (PyInstaller).
     """
     try:
-        # When packaged with PyInstaller, sys._MEIPASS points to the temp folder
         base_path = sys._MEIPASS
     except AttributeError:
-        # In development mode, use current working directory
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
 # ───────────────────────────────
 # Load TorchScript Model
 # ───────────────────────────────
-# Define model path using resource_path helper
 MODEL_PATH = resource_path("app/model/pod_segmentation_scriptedV3.pt")
-
-# Automatically select GPU if available, else fallback to CPU
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load the serialized TorchScript model
-model = torch.jit.load(MODEL_PATH, map_location=DEVICE).to(DEVICE).eval()
+model = None
+try:
+    model = torch.jit.load(MODEL_PATH, map_location=DEVICE).to(DEVICE).eval()
+    print(f"[{os.path.basename(__file__)}] Main segmentation model loaded successfully from {MODEL_PATH} on {DEVICE}.")
+except Exception as e:
+    print(f"[{os.path.basename(__file__)}] ERROR loading main segmentation model: {e}")
+    print(f"[{os.path.basename(__file__)}] Please ensure '{MODEL_PATH}' exists and is a valid TorchScript model.")
 
 # ───────────────────────────────
 # Main Web Route: Upload & Inference
@@ -51,19 +50,54 @@ def index():
     - POST: Receives uploaded image, runs model inference,
             and returns composite visualization results
     """
+    result_for_template = None
+    image_name_for_template = None
+    error_message = None
+
+    print(f"[{os.path.basename(__file__)}] Request method: {request.method}")
+
     if request.method == "POST":
         image_file = request.files.get("image")
-        if image_file:
-            # Save uploaded file to static/uploads/
-            upload_path = os.path.join("app", "static", "uploads", image_file.filename)
-            os.makedirs(os.path.dirname(upload_path), exist_ok=True)
-            image_file.save(upload_path)
+        if image_file and image_file.filename != '':
+            print(f"[{os.path.basename(__file__)}] Image file received: {image_file.filename}")
+            if model is None:
+                error_message = "Segmentation model failed to load. Cannot process image."
+                print(f"[{os.path.basename(__file__)}] ERROR: Segmentation model is None.")
+            else:
+                original_filename = image_file.filename
+                
+                upload_dir = os.path.join(os.path.dirname(__file__), "static", "uploads")
+                os.makedirs(upload_dir, exist_ok=True)
+                
+                temp_upload_path = os.path.join(upload_dir, f"temp_{uuid.uuid4().hex}_{original_filename}")
+                image_file.save(temp_upload_path)
+                print(f"[{os.path.basename(__file__)}] Image saved temporarily to: {temp_upload_path}")
 
-            # Run model on the uploaded image and generate summary output
-            result = process_image_and_get_pods(upload_path, model, DEVICE)
+                try:
+                    print(f"[{os.path.basename(__file__)}] Calling process_image_and_get_pods...")
+                    result_data = process_image_and_get_pods(temp_upload_path, model, DEVICE)
+                    print(f"[{os.path.basename(__file__)}] process_image_and_get_pods returned: {result_data}")
 
-            # Render result view with image and output details
-            return render_template("index.html", result=result, image_name=image_file.filename)
+                    if result_data and result_data.get('composite_img'):
+                        result_for_template = result_data
+                        image_name_for_template = result_data['composite_img']
+                    else:
+                        error_message = "Image processing completed but no composite image was generated."
+                        print(f"[{os.path.basename(__file__)}] WARNING: No composite image returned from process_image_and_get_pods.")
 
-    # If GET request, simply load upload interface
-    return render_template("index.html")
+                except Exception as e:
+                    error_message = f"Error processing image: {e}"
+                    print(f"[{os.path.basename(__file__)}] ERROR during image processing: {e}")
+                finally:
+                    if os.path.exists(temp_upload_path):
+                        os.remove(temp_upload_path)
+                        print(f"[{os.path.basename(__file__)}] Removed temporary image: {temp_upload_path}")
+        else:
+            error_message = "No image file provided or file is empty."
+            print(f"[{os.path.basename(__file__)}] WARNING: No image file or empty file received.")
+
+    print(f"[{os.path.basename(__file__)}] Rendering index.html. image_name_for_template: {image_name_for_template}, Result dict exists: {result_for_template is not None}, Error: {error_message is not None}")
+    return render_template("index.html",
+                           result=result_for_template,
+                           image_name=image_name_for_template,
+                           error_message=error_message)
