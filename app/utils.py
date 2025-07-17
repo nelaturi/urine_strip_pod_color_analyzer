@@ -1,3 +1,6 @@
+import matplotlib
+matplotlib.use('Agg') # This line MUST be before 'import matplotlib.pyplot as plt'
+
 import os
 import cv2
 import uuid
@@ -7,10 +10,10 @@ import numpy as np
 from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt # This import should come AFTER matplotlib.use('Agg')
 import joblib
 from skimage.color import rgb2lab
-# No longer strictly need colormath imports if not calculating delta_e for display
+
 
 # ───────────────────────────────
 # Constants & Configuration
@@ -92,14 +95,14 @@ COLOR_NAMES = {
 
 REFERENCE_VALUES = {
     "pod1": {
-        "10 (0.1)": 10,   # Creatinine in mg/dL
+        "10 (0.1)": 10,    # Creatinine in mg/dL
         "50 (0.5)": 50,
         "100 (1.0)": 100,
         "200 (2.0)": 200,
         "300 (4.0)": 300,
     },
     "pod2": {
-        "10": 10,   # Microalbumin in mg/g or μg/mL
+        "10": 10,    # Microalbumin in mg/g or μg/mL
         "30": 30,
         "80": 80,
         "150": 150,
