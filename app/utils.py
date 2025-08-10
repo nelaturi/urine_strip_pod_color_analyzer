@@ -1,5 +1,5 @@
 import matplotlib
-matplotlib.use('Agg') # This line MUST be before 'import matplotlib.pyplot as plt'
+matplotlib.use('Agg') # MUST be before importing pyplot
 
 import os
 import cv2
@@ -10,24 +10,35 @@ import numpy as np
 from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-import matplotlib.pyplot as plt # This import should come AFTER matplotlib.use('Agg')
+import matplotlib.pyplot as plt # After matplotlib.use
 import joblib
 from skimage.color import rgb2lab
+import math
 
+# Try to use ΔE2000; fall back to CIE76 if not available
+try:
+    from skimage.color import deltaE_ciede2000 as _deltaE2000
+    HAVE_DE00 = True
+except Exception:
+    HAVE_DE00 = False
 
 # ───────────────────────────────
 # Constants & Configuration
 # ───────────────────────────────
 
-# Class indices corresponding to the segmentation model output
-# 4 = Pod1 (Creatinine), 5 = Pod2 (Microalbumin)
+# Segmentation indices: Pod1=Creatinine, Pod2=Microalbumin
 POD1_IDX, POD2_IDX = 4, 5
 
-# Albumentations preprocessing pipeline for inference
+# Distance/override thresholds (tune on validation)
+MICRO_DELTAE_ACCEPT = 8.0     # accept color centroid if best ΔE <= this
+MICRO_DELTAE_MARGIN = 3.0     # require ΔE_reg - ΔE_best > margin to override regression
+POD_ERODE_KERNEL = 3          # 3x3 erosion to avoid edges
+WB_EPS = 1e-6                 # numerics for white balance
+
+# Preprocessing pipeline (keep model input unchanged)
 val_tf = A.Compose([
     A.Resize(256, 256),
-    A.Normalize(mean=(0.485, 0.456, 0.406),
-                std=(0.229, 0.224, 0.225)),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ToTensorV2()
 ])
 
@@ -36,338 +47,256 @@ val_tf = A.Compose([
 # ───────────────────────────────
 
 def resource_path(relative_path):
-    """
-    Get absolute path to resource.
-    Works both in development and in PyInstaller-packed executables.
-    """
     try:
         base_path = sys._MEIPASS
     except AttributeError:
-        base_path = os.path.abspath(".")
+        base_path = os.path.abspath('.')
     return os.path.join(base_path, relative_path)
 
 # ───────────────────────────────
-# Load Calibrated Models
+# Load Regression Models
 # ───────────────────────────────
-
-CREATININE_MODEL_PATH = resource_path("app/model/creatinine_model.pkl")
-MICROALBUMIN_MODEL_PATH = resource_path("app/model/microalbumin_model.pkl")
+CREATININE_MODEL_PATH = resource_path('app/model/creatinine_model.pkl')
+MICROALBUMIN_MODEL_PATH = resource_path('app/model/microalbumin_model.pkl')
 
 model_creat = None
 model_micro = None
-
 try:
     model_creat = joblib.load(CREATININE_MODEL_PATH)
     model_micro = joblib.load(MICROALBUMIN_MODEL_PATH)
-    print(f"[{os.path.basename(__file__)}] Calibrated models (Creatinine, Microalbumin) loaded successfully.")
+    print(f"[{os.path.basename(__file__)}] Loaded calibrated models.")
 except Exception as e:
-    print(f"[{os.path.basename(__file__)}] ERROR loading calibrated models: {e}")
-    print(f"[{os.path.basename(__file__)}] Please ensure '{CREATININE_MODEL_PATH}' and '{MICROALBUMIN_MODEL_PATH}' exist.")
+    print(f"[{os.path.basename(__file__)}] ERROR loading models: {e}")
 
-
-POD_COLOR_CHART = {
-    "pod2": {  # Microalbumin
-        "10": (224, 255, 224),     # very light green
-        "30": (204, 255, 153),     # light green-yellow
-        "80": (255, 255, 102),     # bright yellow
-        "150": (255, 204, 0),      # golden yellow
-    },
-    "pod1": {  # Creatinine
-        "10 (0.1)": (255, 204, 153),   # pale orange
-        "50 (0.5)": (255, 153, 51),    # orange
-        "100 (1.0)": (204, 102, 0),    # burnt orange
-        "200 (2.0)": (153, 76, 0),     # brownish orange
-        "300 (4.0)": (128, 64, 0),     # dark brown
-    }
+# ───────────────────────────────
+# Empirical RGB Centroids
+# ───────────────────────────────
+# Microalbumin (pod2)
+MICROALBUMIN_CENTROIDS = {
+    10:   (177.0, 182.0, 168.0),
+    30:   (160.0, 181.0, 170.0),
+    80:   (162.0, 176.0, 169.0),
+    150:  (153.0, 180.0, 175.0),
+    250:  (132.0, 168.0, 162.0),
+    400:  (140.0, 173.9, 174.1),
+    600:  (125.0, 164.0, 163.0),
+    800:  (138.0, 174.0, 178.0),
+    1000: (134.0, 176.0, 184.0),
+    1400: (158.0, 188.0, 192.0),
 }
 
-COLOR_NAMES = {
-    "10": "very light green",
-    "30": "light yellow green",
-    "80": "bright yellow",
-    "150": "golden yellow",
-    "10 (0.1)": "pale orange",
-    "50 (0.5)": "vivid orange",
-    "100 (1.0)": "burnt orange",
-    "200 (2.0)": "brown orange",
-    "300 (4.0)": "dark brown"
-}
-
-REFERENCE_VALUES = {
-    "pod1": {
-        "10 (0.1)": 10,    # Creatinine in mg/dL
-        "50 (0.5)": 50,
-        "100 (1.0)": 100,
-        "200 (2.0)": 200,
-        "300 (4.0)": 300,
-    },
-    "pod2": {
-        "10": 10,    # Microalbumin in mg/g or μg/mL
-        "30": 30,
-        "80": 80,
-        "150": 150,
-    }
+# Creatinine (pod1)
+CREATININE_CENTROIDS = {
+    "10 (0.1)":  (187, 172, 51),
+    "50 (0.5)":  (178, 167, 49),
+    "100 (1.0)": (169, 168, 55),
+    "150 (1.5)": (144, 152, 53),
+    "200 (2.0)": (135, 145, 55),
+    # "300 (4.0)": (...)  # add when available
 }
 
 # ───────────────────────────────
-# Utility: Extract Features for Calibration Models
+# Color-space helpers
+# ───────────────────────────────
+
+def _rgb_to_lab_triplet(rgb_triplet):
+    """rgb_triplet -> Lab triplet using skimage (expects uint8 or float in [0,1])."""
+    arr = np.uint8([[rgb_triplet]])
+    return rgb2lab(arr).reshape(3,).astype(np.float64)
+
+def _lab_distance(lab1, lab2, wL=0.5):
+    """ΔE2000 if available; else weighted CIE76 with reduced L weight."""
+    if HAVE_DE00:
+        a = np.array(lab1, dtype=np.float64).reshape(1, 1, 3)
+        b = np.array(lab2, dtype=np.float64).reshape(1, 1, 3)
+        return float(_deltaE2000(a, b)[0, 0])
+    dL = (lab1[0] - lab2[0]) * math.sqrt(max(wL, 0.0))
+    da = lab1[1] - lab2[1]
+    db = lab1[2] - lab2[2]
+    return float(math.sqrt(dL*dL + da*da + db*db))
+
+MICROALBUMIN_CENTROIDS_LAB = {k: _rgb_to_lab_triplet(v) for k, v in MICROALBUMIN_CENTROIDS.items()}
+CREATININE_CENTROIDS_LAB = {k: _rgb_to_lab_triplet(v) for k, v in CREATININE_CENTROIDS.items()}
+
+# ───────────────────────────────
+# White balance & robust color extraction
+# ───────────────────────────────
+
+def gray_world_white_balance(img_uint8):
+    img = img_uint8.astype(np.float32)
+    means = img.reshape(-1, 3).mean(axis=0) + WB_EPS
+    gray = float(means.mean())
+    gains = gray / means
+    balanced = np.clip(img * gains, 0, 255).astype(np.uint8)
+    return balanced
+
+def eroded_mask(mask_bool, ksize=POD_ERODE_KERNEL, iterations=1):
+    if not mask_bool.any(): return mask_bool
+    k = np.ones((ksize, ksize), np.uint8)
+    er = cv2.erode(mask_bool.astype(np.uint8), k, iterations=iterations)
+    return er.astype(bool)
+
+def masked_median_rgb(img_uint8, mask_bool):
+    if not mask_bool.any(): return np.array([0, 0, 0], dtype=np.uint8)
+    pix = img_uint8[mask_bool]
+    med = np.median(pix, axis=0).round().astype(np.uint8)
+    return med
+
+# ───────────────────────────────
+# Nearest-centroid utilities (Lab)
+# ───────────────────────────────
+
+def nearest_micro_centroid_lab(lab_obs):
+    best_label, best_de = None, float('inf')
+    for lbl, lab_c in MICROALBUMIN_CENTROIDS_LAB.items():
+        de = _lab_distance(lab_obs, lab_c)
+        if de < best_de: best_de, best_label = de, lbl
+    return best_label, best_de
+
+def nearest_creatinine_centroid_lab(lab_obs):
+    best_label, best_de = None, float('inf')
+    for lbl, lab_c in CREATININE_CENTROIDS_LAB.items():
+        de = _lab_distance(lab_obs, lab_c)
+        if de < best_de: best_de, best_label = de, lbl
+    return best_label, best_de
+
+# ───────────────────────────────
+# Color Charts & Reference Values
+# ───────────────────────────────
+POD_COLOR_CHART = {
+    'pod2': {label: tuple(map(int, MICROALBUMIN_CENTROIDS[label])) for label in MICROALBUMIN_CENTROIDS},
+    'pod1': {'10 (0.1)': (255, 204, 153), '50 (0.5)': (255, 153, 51), '100 (1.0)': (204, 102, 0),
+             '150 (1.5)': (191, 120, 10), '200 (2.0)': (153, 76, 0), '300 (4.0)': (128, 64, 0)}
+}
+REFERENCE_VALUES = {
+    'pod2': {**{str(label): label for label in MICROALBUMIN_CENTROIDS}, '1800': 1800},
+    'pod1': {'10 (0.1)': 10, '50 (0.5)': 50, '100 (1.0)': 100, '150 (1.5)': 150, '200 (2.0)': 200, '300 (4.0)': 300}
+}
+
+# ───────────────────────────────
+# Feature Extraction & Calibration
 # ───────────────────────────────
 
 def extract_features_from_rgb(rgb_triplet):
-    """
-    Extracts RGB, HSV, and Lab features from an RGB color triplet.
-    Input rgb_triplet should be a tuple/list of 3 integers (0-255).
-    """
-    rgb_array = np.uint8([[rgb_triplet]])
-    lab = rgb2lab(rgb_array).reshape(3,)
-    hsv = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV).reshape(3,)
+    rgb_arr = np.uint8([[rgb_triplet]])
+    lab = rgb2lab(rgb_arr).reshape(3,)
+    hsv = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2HSV).reshape(3,)
     return list(rgb_triplet) + list(hsv) + list(lab)
 
 def get_calibrated_value(rgb_triplet, pod_type):
-    """
-    Uses the calibrated models to predict the clinical value for a given RGB triplet.
-    Returns None if models are not loaded or pod_type is invalid.
-    """
-    if model_creat is None or model_micro is None:
-        print(f"[{os.path.basename(__file__)}] WARNING: Calibrated models not loaded, returning None for {pod_type}.")
-        return None
-
+    if model_creat is None or model_micro is None: return None
     features = extract_features_from_rgb(rgb_triplet)
-
     try:
-        if pod_type == "creatinine":
-            return float(model_creat.predict([features])[0])
-        elif pod_type == "microalbumin":
-            return float(model_micro.predict([features])[0])
-        else:
-            print(f"[{os.path.basename(__file__)}] WARNING: Unknown pod_type '{pod_type}'. No calibrated value available.")
-            return None
-    except Exception as e:
-        print(f"[{os.path.basename(__file__)}] ERROR predicting with calibrated model for {pod_type}: {e}")
-        return None
+        if pod_type == 'creatinine': return float(model_creat.predict([features])[0])
+        if pod_type == 'microalbumin': return float(model_micro.predict([features])[0])
+    except Exception: return None
 
-
-# ───────────────────────────────
-# Utility: Find Closest Color Match (now purely for color name, not primary value)
-# ───────────────────────────────
-
-def match_patch_color(pod_rgb, pod_type):
-    """
-    Given the mean RGB of a pod region, find the closest matching
-    clinical label and color name based on the reference chart.
-    This is now primarily for generating a human-readable color name for the image text.
-    """
-    ref_colors = POD_COLOR_CHART[pod_type]
-    pod_rgb = np.array(pod_rgb).astype(np.float32)
-
-    min_dist = float("inf")
-    closest_label_by_rgb = "Unknown"
-
-    for label, ref_rgb in ref_colors.items():
-        ref_rgb = np.array(ref_rgb).astype(np.float32)
-        dist = np.linalg.norm(pod_rgb - ref_rgb)
-        if dist < min_dist:
-            min_dist = dist
-            closest_label_by_rgb = label
-
-    color_name = COLOR_NAMES.get(closest_label_by_rgb, "Unknown color")
-    return closest_label_by_rgb, color_name # Return original label and color name
-
+def find_closest_reference_value_label(val, pod_type):
+    if val is None: return '1800' if pod_type == 'pod2' else '300 (4.0)'
+    chart, best, md = REFERENCE_VALUES.get(pod_type, {}), None, float('inf')
+    for lbl, rv in chart.items():
+        diff = abs(val - rv)
+        if diff < md: md, best = diff, lbl
+    return best or f"{val:.2f}"
 
 # ───────────────────────────────
-# Utility: Find Closest Reference Chart Value
+# Composite Visualization
 # ───────────────────────────────
-def find_closest_reference_value_label(calibrated_value, pod_type):
-    """
-    Given a calibrated numerical value, find the closest label from the
-    predefined REFERENCE_VALUES chart for the given pod type.
-    """
-    if calibrated_value is None:
-        return "N/A"
 
-    ref_chart = REFERENCE_VALUES.get(pod_type)
-    if not ref_chart:
-        return f"{calibrated_value:.2f}" # Fallback if no reference chart defined
+def save_composite_visual(raw_img, pod1_region, pod2_region,
+                          p1_mean, p2_mean,
+                          calibrated_p1, calibrated_p2,
+                          uacr_category,
+                          save_path):
+    fig, axs = plt.subplots(1, 3, figsize=(9, 5)) # Slightly reduced figure size
+    axs[0].imshow(raw_img); axs[0].axis('off'); axs[0].set_title('Original')
 
-    min_diff = float('inf')
-    closest_label = None
+    patch1 = np.ones((50, 50, 3), np.uint8) * p1_mean.reshape(1, 1, 3) # Reduced pod size
+    disp1 = find_closest_reference_value_label(calibrated_p1, 'pod1')
+    axs[1].imshow(patch1); axs[1].axis('off'); axs[1].set_title(f"Creatinine\n{disp1}\nRGB{tuple(p1_mean)}")
 
-    for label, ref_value in ref_chart.items():
-        diff = abs(calibrated_value - ref_value)
-        if diff < min_diff:
-            min_diff = diff
-            closest_label = label
+    patch2 = np.ones((50, 50, 3), np.uint8) * p2_mean.reshape(1, 1, 3) # Reduced pod size
+    lab_obs = _rgb_to_lab_triplet(tuple(p2_mean))
+    color_lbl, color_de = nearest_micro_centroid_lab(lab_obs)
+    reg_lbl = find_closest_reference_value_label(calibrated_p2, 'pod2')
     
-    return closest_label if closest_label is not None else f"{calibrated_value:.2f}" # Fallback if no closest found
+    if reg_lbl.isdigit() and int(reg_lbl) in MICROALBUMIN_CENTROIDS_LAB:
+        lab_reg_cent = MICROALBUMIN_CENTROIDS_LAB[int(reg_lbl)]
+        reg_de = _lab_distance(lab_obs, lab_reg_cent)
+    else:
+        reg_de = float('inf')
 
+    disp2 = color_lbl if (color_de <= MICRO_DELTAE_ACCEPT) and ((reg_de - color_de) > MICRO_DELTAE_MARGIN) else reg_lbl
+    axs[2].imshow(patch2); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2}\nRGB{tuple(p2_mean)}")
 
-# ───────────────────────────────
-# Generate Annotated Visual Output (MODIFIED FOR RAW IMAGE DISPLAY)
-# ───────────────────────────────
-
-def save_composite_visual(raw_img, pod1_region, pod2_region, p1_mean, p2_mean,
-                          calibrated_p1_value, calibrated_p2_value, save_path):
-    """
-    Save a visual summary image containing:
-    - Original uploaded image
-    - Color patch for each pod
-    - RGB values
-    - Calibrated clinical label (or original if calibration fails)
-    - Color name
-    """
-    print(f"[{os.path.basename(__file__)}] Starting save_composite_visual...")
-
-    # Define figure and subplots: 1 row, 3 columns
-    # Adjust figsize to accommodate the third image while maintaining aspect ratio
-    fig, axs = plt.subplots(1, 3, figsize=(9.5, 5)) # Increased width from 6.5 to 9.5
-
-    # --- Plot Original Image ---
-    axs[0].imshow(raw_img)
-    axs[0].set_title("Original Image", fontsize=11)
-    axs[0].axis("off")
-    # Ensure aspect ratio is preserved and image fills the subplot height
-    axs[0].set_aspect('auto') # 'auto' will stretch/squish to fill axes, 'equal' keeps aspect.
-                            # 'auto' often works better for mixed content. If you want strict aspect,
-                            # you might need to pad the image or adjust figure dimensions carefully.
-                            # Given "reduce image size... but appearance should not change", 'auto' is flexible.
-                            # For fixed aspect, set: axs[0].set_aspect('equal', adjustable='box')
-
-
-    # Generate color patches from average RGB
-    patch_size = 70
-    patch1 = np.ones((patch_size, patch_size, 3), dtype=np.uint8) * p1_mean.reshape(1, 1, 3)
-    patch2 = np.ones((patch_size, patch_size, 3), dtype=np.uint8) * p2_mean.reshape(1, 1, 3)
-
-    # Get human-readable color names (still based on original chart for description)
-    _, colorname1 = match_patch_color(p1_mean, "pod1")
-    _, colorname2 = match_patch_color(p2_mean, "pod2")
-
-    # Determine the value to display for Creatinine - NOW SNAPPED TO REFERENCE LABEL
-    display_value_p1 = find_closest_reference_value_label(calibrated_p1_value, "pod1")
-
-    # Determine the value to display for Microalbumin - NOW SNAPPED TO REFERENCE LABEL
-    display_value_p2 = find_closest_reference_value_label(calibrated_p2_value, "pod2")
-
-
-    # --- Plot Pod1 = Creatinine (now in axs[1]) ---
-    axs[1].imshow(patch1)
-    axs[1].axis("off")
-    axs[1].text(0.5, 1.3, "Creatinine", fontsize=11, ha="center", transform=axs[1].transAxes)
-    axs[1].text(0.5, 1.18, f"Color: {colorname1}", fontsize=10, ha="center", transform=axs[1].transAxes)
-    axs[1].text(0.5, 1.05, f"Value: {display_value_p1}", fontsize=10, ha="center", transform=axs[1].transAxes)
-    axs[1].text(0.5, -0.25, f"RGB ({p1_mean[0]}, {p1_mean[1]}, {p1_mean[2]})",
-                fontsize=10, ha="center", va="top", transform=axs[1].transAxes)
-
-    # --- Plot Pod2 = Microalbumin (now in axs[2]) ---
-    axs[2].imshow(patch2)
-    axs[2].axis("off")
-    axs[2].text(0.5, 1.3, "Microalbumin", fontsize=11, ha="center", transform=axs[2].transAxes)
-    axs[2].text(0.5, 1.18, f"Color: {colorname2}", fontsize=10, ha="center", transform=axs[2].transAxes)
-    axs[2].text(0.5, 1.05, f"Value: {display_value_p2}", fontsize=10, ha="center", transform=axs[2].transAxes)
-    axs[2].text(0.5, -0.25, f"RGB ({p2_mean[0]}, {p2_mean[1]}, {p2_mean[2]})",
-                fontsize=10, ha="center", va="top", transform=axs[2].transAxes)
-
-    plt.subplots_adjust(top=0.9, bottom=0.25)
+    # Improved UACR text placement and size
+    if uacr_category:
+        color = 'darkgreen' if 'A1' in uacr_category else '#D98E04' if 'A2' in uacr_category else 'darkred'
+        try:
+            paren_pos = uacr_category.index('(')
+            formatted_text = uacr_category[:paren_pos].strip() + '\n' + uacr_category[paren_pos:]
+        except ValueError:
+            formatted_text = uacr_category
+        fig.suptitle(f"UACR Result\n{formatted_text}", fontsize=12, fontweight='bold', color=color, y=0.92) # Adjusted y and font size
     
+    plt.tight_layout(rect=[0, 0.03, 1, 0.88]) # Further adjust layout for suptitle
     try:
         plt.savefig(save_path, bbox_inches='tight', dpi=150)
-        print(f"[{os.path.basename(__file__)}] Composite image saved to: {save_path}")
-    except Exception as e:
-        print(f"[{os.path.basename(__file__)}] ERROR saving composite image to {save_path}: {e}")
     finally:
-        plt.close(fig) # Always close the figure to free up memory
+        plt.close(fig)
 
 # ───────────────────────────────
-# Main Inference Logic (no change required here beyond passing raw_img)
+# UACR Calculation & Categorization
+# ───────────────────────────────
+
+def calculate_uacr_and_category(albumin_mg_l, creatinine_mg_dl):
+    if albumin_mg_l is None or creatinine_mg_dl is None or creatinine_mg_dl <= 0:
+        return None, "Indeterminate: One or both values could not be calculated."
+    uacr = 100.0 * albumin_mg_l / creatinine_mg_dl
+    if uacr < 30:
+        category = "A1 Proteinuria: < 30 mg/G (healthy range, don’t require treatment)"
+    elif 30 <= uacr <= 300:
+        category = "A2 Proteinurs : >= 30 - 300 mg/G (early Kidney Disease, moderate increased risk,\nrequires lifestyle modification and regular follow-up)"
+    else:
+        category = "A3 Proteinuria : > 300 mg/G (severe risk, advanced kidney disease, requires evaluation, treatment)"
+    return round(uacr, 2), category
+
+# ───────────────────────────────
+# Main Inference
 # ───────────────────────────────
 
 def process_image_and_get_pods(image_path, model, device):
-    """
-    Full image processing pipeline:
-    - Load uploaded image
-    - Preprocess and infer using segmentation model
-    - Identify pod masks
-    - Compute RGB means
-    - Apply calibrated models to get refined clinical values
-    - Generate visual summary (with calibrated values) and return composite image filename
-    """
-    print(f"[{os.path.basename(__file__)}] Starting process_image_and_get_pods for {image_path}")
+    img_pil = Image.open(image_path).convert('RGB')
+    if img_pil.width > img_pil.height:
+        img_pil = img_pil.rotate(90, expand=True)
+    raw_np = np.array(img_pil)
 
-    base_filename = os.path.splitext(os.path.basename(image_path))[0]
-    unique_id = uuid.uuid4().hex[:6]
+    model_input = val_tf(image=raw_np)['image'].unsqueeze(0).to(device)
+    with torch.no_grad():
+        logits = model(model_input)
+        preds  = logits.argmax(1).cpu().numpy()[0]
+    mask = cv2.resize(preds.astype(np.uint8), raw_np.shape[:2][::-1], interpolation=cv2.INTER_NEAREST)
 
-    try:
-        img_pil = Image.open(image_path).convert("RGB")
-        if img_pil.width > img_pil.height:
-            img_pil = img_pil.rotate(90, expand=True)
-        img_np = np.array(img_pil) # This is the raw image numpy array
-        original_size = img_np.shape[:2]
-        print(f"[{os.path.basename(__file__)}] Image loaded and dimensions: {original_size}")
-    except Exception as e:
-        print(f"[{os.path.basename(__file__)}] ERROR: Could not load or process image {image_path}: {e}")
-        raise # Re-raise to be caught by routes.py
+    def mean_rgb_raw(img_uint8, m_bool):
+        if not m_bool.any(): return np.zeros(3, dtype=np.uint8)
+        return np.round(img_uint8[m_bool].mean(0)).astype(np.uint8)
 
-    try:
-        model_input = val_tf(image=img_np)["image"].unsqueeze(0).to(device)
-        with torch.no_grad():
-            logits = model(model_input)
-            preds = logits.argmax(dim=1).cpu().numpy()[0]
-        print(f"[{os.path.basename(__file__)}] Model inference completed.")
-    except Exception as e:
-        print(f"[{os.path.basename(__file__)}] ERROR: Model inference failed: {e}")
-        raise
+    p1_mean_raw = mean_rgb_raw(raw_np, (mask == POD1_IDX))
+    p2_mean_raw = mean_rgb_raw(raw_np, (mask == POD2_IDX))
 
-    mask_resized = cv2.resize(preds.astype(np.uint8), (original_size[1], original_size[0]), interpolation=cv2.INTER_NEAREST)
+    wb_np = gray_world_white_balance(raw_np)
+    p1_mean_ui = masked_median_rgb(wb_np, eroded_mask((mask == POD1_IDX)))
+    p2_mean_ui = masked_median_rgb(wb_np, eroded_mask((mask == POD2_IDX)))
+
+    c1 = get_calibrated_value(tuple(p1_mean_raw), 'creatinine')
+    c2 = get_calibrated_value(tuple(p2_mean_raw), 'microalbumin')
+    uacr_value, uacr_category = calculate_uacr_and_category(c2, c1)
+
+    out_dir = os.path.join(os.path.dirname(__file__), 'static', 'uploads')
+    os.makedirs(out_dir, exist_ok=True)
+    fname = f"{os.path.splitext(os.path.basename(image_path))[0]}_{uuid.uuid4().hex[:6]}.png"
+    fpath = os.path.join(out_dir, fname)
     
-    # Initialize regions as black if no pixels are found
-    pod1_region = np.zeros_like(img_np)
-    pod2_region = np.zeros_like(img_np)
-
-    pod1_mask = (mask_resized == POD1_IDX)
-    pod2_mask = (mask_resized == POD2_IDX)
-
-    if pod1_mask.any():
-        pod1_region = np.where(pod1_mask[..., None], img_np, 0)
-        p1_pix = pod1_region[pod1_mask].astype(np.float32)
-        p1_mean = np.round(p1_pix.mean(axis=0)).astype(np.uint8)
-        print(f"[{os.path.basename(__file__)}] Pod1 (Creatinine) detected. Mean RGB: {p1_mean}")
-    else:
-        p1_mean = np.array([0, 0, 0], dtype=np.uint8)
-        print(f"[{os.path.basename(__file__)}] Pod1 (Creatinine) NOT detected. Defaulting to black RGB.")
-
-
-    if pod2_mask.any():
-        pod2_region = np.where(pod2_mask[..., None], img_np, 0)
-        p2_pix = pod2_region[pod2_mask].astype(np.float32)
-        p2_mean = np.round(p2_pix.mean(axis=0)).astype(np.uint8)
-        print(f"[{os.path.basename(__file__)}] Pod2 (Microalbumin) detected. Mean RGB: {p2_mean}")
-    else:
-        p2_mean = np.array([0, 0, 0], dtype=np.uint8)
-        print(f"[{os.path.basename(__file__)}] Pod2 (Microalbumin) NOT detected. Defaulting to black RGB.")
-
-
-    # --- Get calibrated clinical values ---
-    calibrated_creatinine_value = get_calibrated_value(tuple(p1_mean), "creatinine")
-    calibrated_microalbumin_value = get_calibrated_value(tuple(p2_mean), "microalbumin")
-    print(f"[{os.path.basename(__file__)}] Calibrated Creatinine: {calibrated_creatinine_value}, Microalbumin: {calibrated_microalbumin_value}")
-    # --- END NEW ---
-
-    output_folder = os.path.join(os.path.dirname(__file__), "static", "uploads")
-    os.makedirs(output_folder, exist_ok=True)
-
-    composite_filename = f"{base_filename}_visual_{unique_id}.png"
-    composite_path = os.path.join(output_folder, composite_filename)
-
-    # --- Pass raw_img and calibrated values to save_composite_visual ---
-    try:
-        save_composite_visual(img_np, pod1_region, pod2_region, p1_mean, p2_mean,
-                              calibrated_creatinine_value, calibrated_microalbumin_value,
-                              composite_path)
-    except Exception as e:
-        print(f"[{os.path.basename(__file__)}] ERROR in save_composite_visual: {e}")
-        return {"composite_img": None}
-
-
-    return {
-        "composite_img": composite_filename
-    }
+    save_composite_visual(raw_np, None, None, p1_mean_ui, p2_mean_ui, c1, c2, uacr_category, fpath)
+    
+    return {'composite_img': fname, 'uacr_category': uacr_category}
