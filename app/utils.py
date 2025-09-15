@@ -2,7 +2,6 @@ import logging
 import matplotlib
 matplotlib.use('Agg') # MUST be before importing pyplot
 
-
 import os
 import cv2
 import uuid
@@ -70,13 +69,13 @@ try:
 except Exception as e:
     logging.error("FATAL: Failed to load .pkl models.", exc_info=True)
 
-
 # ───────────────────────────────
 # Empirical RGB Centroids
 # ───────────────────────────────
-# Microalbumin (pod2)
+# Microalbumin (pod2) → new bin 3, updated bin 10
 MICROALBUMIN_CENTROIDS = {
-    10:   (177.0, 182.0, 168.0),
+    3:    (176, 180, 165),   # New bin (from Label 3 dataset)
+    10:   (177, 182, 171),   # Updated centroid from new Label 10 dataset
     30:   (160.0, 181.0, 170.0),
     80:   (162.0, 176.0, 169.0),
     150:  (153.0, 180.0, 175.0),
@@ -88,13 +87,15 @@ MICROALBUMIN_CENTROIDS = {
     1400: (158.0, 188.0, 192.0),
 }
 
-# Creatinine (pod1)
+# Creatinine (pod1) → added bin 25
 CREATININE_CENTROIDS = {
-    "10 (0.1)":  (187, 172, 51),
+    "10 (0.1)":  (190, 177, 52), # Updated centroid from new Label 10 dataset
+    "25 (0.25)": (184, 168, 47),  # New bin (from Label 25 dataset)
     "50 (0.5)":  (178, 167, 49),
     "100 (1.0)": (169, 168, 55),
     "150 (1.5)": (144, 152, 53),
     "200 (2.0)": (135, 145, 55),
+    "300 (4.0)": (128, 64, 0)
 }
 
 # ───────────────────────────────
@@ -110,7 +111,6 @@ def _lab_distance(lab1, lab2, wL=0.5):
         a = np.array(lab1, dtype=np.float64).reshape(1, 1, 3)
         b = np.array(lab2, dtype=np.float64).reshape(1, 1, 3)
         return float(_deltaE2000(a, b)[0, 0])
-    # ** CORRECTED **
     dL = (lab1[0] - lab2[0]) * math.sqrt(max(wL, 0.0))
     da = lab1[1] - lab2[1]
     db = lab1[2] - lab2[2]
@@ -139,7 +139,6 @@ def eroded_mask(mask_bool, ksize=POD_ERODE_KERNEL, iterations=1):
 
 def masked_median_rgb(img_uint8, mask_bool):
     if not mask_bool.any(): return np.array([0, 0, 0], dtype=np.uint8)
-    # ** CORRECTED **
     pix = img_uint8[mask_bool]
     med = np.median(pix, axis=0).round().astype(np.uint8)
     return med
@@ -166,14 +165,15 @@ def nearest_creatinine_centroid_lab(lab_obs):
 # Color Charts & Reference Values
 # ───────────────────────────────
 POD_COLOR_CHART = {
-    # ** CORRECTED **
     'pod2': {label: tuple(map(int, MICROALBUMIN_CENTROIDS[label])) for label in MICROALBUMIN_CENTROIDS},
-    'pod1': {'10 (0.1)': (255, 204, 153), '50 (0.5)': (255, 153, 51), '100 (1.0)': (204, 102, 0),
-             '150 (1.5)': (191, 120, 10), '200 (2.0)': (153, 76, 0), '300 (4.0)': (128, 64, 0)}
+    'pod1': {label: tuple(map(int, CREATININE_CENTROIDS[label])) for label in CREATININE_CENTROIDS}
 }
+
 REFERENCE_VALUES = {
     'pod2': {**{str(label): label for label in MICROALBUMIN_CENTROIDS}, '1800': 1800},
-    'pod1': {'10 (0.1)': 10, '50 (0.5)': 50, '100 (1.0)': 100, '150 (1.5)': 150, '200 (2.0)': 200, '300 (4.0)': 300}
+    'pod1': {'10 (0.1)': 10, '25 (0.25)': 25, '50 (0.5)': 50,
+             '100 (1.0)': 100, '150 (1.5)': 150,
+             '200 (2.0)': 200, '300 (4.0)': 300}
 }
 
 # ───────────────────────────────
@@ -200,7 +200,6 @@ def get_calibrated_value(rgb_triplet, pod_type):
         logging.error(f"Error during model.predict() for {pod_type}.", exc_info=True)
         return None
 
-
 def find_closest_reference_value_label(val, pod_type):
     if val is None: return '1800' if pod_type == 'pod2' else '300 (4.0)'
     chart, best, md = REFERENCE_VALUES.get(pod_type, {}), None, float('inf')
@@ -214,35 +213,29 @@ def find_closest_reference_value_label(val, pod_type):
 # ───────────────────────────────
 
 def save_composite_visual(raw_img, pod1_region, pod2_region,
-                          p1_mean_raw, p2_mean_raw, # Using raw means for display
+                          p1_mean_raw, p2_mean_raw,
                           calibrated_p1, calibrated_p2,
                           uacr_category,
                           save_path):
     fig, axs = plt.subplots(1, 3, figsize=(9, 5))
-    # ** CORRECTED **
     axs[0].imshow(raw_img); axs[0].axis('off'); axs[0].set_title('Original')
 
-    # Use raw mean for the color patch to match original image
     patch1 = np.ones((50, 50, 3), np.uint8) * p1_mean_raw.reshape(1, 1, 3)
     disp1 = find_closest_reference_value_label(calibrated_p1, 'pod1')
-    # ** CORRECTED **
     axs[1].imshow(patch1); axs[1].axis('off'); axs[1].set_title(f"Creatinine\n{disp1}\nRGB{tuple(p1_mean_raw)}")
 
-    # Use raw mean for the color patch to match original image
     patch2 = np.ones((50, 50, 3), np.uint8) * p2_mean_raw.reshape(1, 1, 3)
-    lab_obs = _rgb_to_lab_triplet(tuple(p2_mean_raw)) # Use raw mean for color check too
+    lab_obs = _rgb_to_lab_triplet(tuple(p2_mean_raw))
     color_lbl, color_de = nearest_micro_centroid_lab(lab_obs)
     reg_lbl = find_closest_reference_value_label(calibrated_p2, 'pod2')
-    
+
     if reg_lbl.isdigit() and int(reg_lbl) in MICROALBUMIN_CENTROIDS_LAB:
-        # ** CORRECTED **
         lab_reg_cent = MICROALBUMIN_CENTROIDS_LAB[int(reg_lbl)]
         reg_de = _lab_distance(lab_obs, lab_reg_cent)
     else:
         reg_de = float('inf')
 
     disp2 = color_lbl if (color_de <= MICRO_DELTAE_ACCEPT) and ((reg_de - color_de) > MICRO_DELTAE_MARGIN) else reg_lbl
-    # ** CORRECTED **
     axs[2].imshow(patch2); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2}\nRGB{tuple(p2_mean_raw)}")
 
     if uacr_category:
@@ -253,7 +246,7 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
         except ValueError:
             formatted_text = uacr_category
         fig.suptitle(f"UACR Result\n{formatted_text}", fontsize=12, fontweight='bold', color=color, y=0.92)
-    
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.88])
     try:
         plt.savefig(save_path, bbox_inches='tight', dpi=150)
@@ -294,13 +287,11 @@ def process_image_and_get_pods(image_path, model, device):
 
     def mean_rgb_raw(img_uint8, m_bool):
         if not m_bool.any(): return np.zeros(3, dtype=np.uint8)
-        # ** CORRECTED **
         return np.round(img_uint8[m_bool].mean(0)).astype(np.uint8)
 
     p1_mean_raw = mean_rgb_raw(raw_np, (mask == POD1_IDX))
     p2_mean_raw = mean_rgb_raw(raw_np, (mask == POD2_IDX))
 
-    # The UI-specific colors are calculated but no longer used for the final image patches
     wb_np = gray_world_white_balance(raw_np)
     p1_mean_ui = masked_median_rgb(wb_np, eroded_mask((mask == POD1_IDX)))
     p2_mean_ui = masked_median_rgb(wb_np, eroded_mask((mask == POD2_IDX)))
@@ -314,7 +305,6 @@ def process_image_and_get_pods(image_path, model, device):
     fname = f"{os.path.splitext(os.path.basename(image_path))[0]}_{uuid.uuid4().hex[:6]}.png"
     fpath = os.path.join(out_dir, fname)
     
-    # Pass the raw mean values to the save function for display
     save_composite_visual(raw_np, None, None, p1_mean_raw, p2_mean_raw, c1, c2, uacr_category, fpath)
     
     return {'composite_img': fname, 'uacr_category': uacr_category}
