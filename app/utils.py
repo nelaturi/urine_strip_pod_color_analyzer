@@ -35,6 +35,11 @@ MICRO_DELTAE_ACCEPT = 8.0     # accept color centroid if best ΔE <= this
 MICRO_DELTAE_MARGIN = 3.0     # require ΔE_reg - ΔE_best > margin to override regression
 POD_ERODE_KERNEL = 3          # 3x3 erosion to avoid edges
 WB_EPS = 1e-6                 # numerics for white balance
+LOW_END_THRESHOLDS = {
+    'microalbumin': 30.0,     # mg/L
+    'creatinine': 25.0,       # mg/dL
+}
+CREATININE_DELTAE_ACCEPT = 8.0  # accept creatinine centroid if best ΔE <= this
 
 # Preprocessing pipeline (keep model input unchanged)
 val_tf = A.Compose([
@@ -160,6 +165,37 @@ def nearest_creatinine_centroid_lab(lab_obs):
         de = _lab_distance(lab_obs, lab_c)
         if de < best_de: best_de, best_label = de, lbl
     return best_label, best_de
+
+def _creatinine_label_to_value(label):
+    if label is None:
+        return None
+    if isinstance(label, (int, float)):
+        return float(label)
+    if isinstance(label, str):
+        try:
+            return float(label.split()[0])
+        except (ValueError, IndexError):
+            return None
+    return None
+
+def apply_low_end_snap(pod_type, rgb_obs, calibrated_value):
+    lab_obs = _rgb_to_lab_triplet(rgb_obs)
+    threshold = LOW_END_THRESHOLDS.get(pod_type)
+    if threshold is None:
+        return calibrated_value, None
+    if calibrated_value is None or calibrated_value > threshold:
+        return calibrated_value, None
+    if pod_type == 'microalbumin':
+        label, de = nearest_micro_centroid_lab(lab_obs)
+        if label is not None and de <= MICRO_DELTAE_ACCEPT:
+            return float(label), label
+    elif pod_type == 'creatinine':
+        label, de = nearest_creatinine_centroid_lab(lab_obs)
+        if label is not None and de <= CREATININE_DELTAE_ACCEPT:
+            snapped_value = _creatinine_label_to_value(label)
+            if snapped_value is not None:
+                return snapped_value, label
+    return calibrated_value, None
 
 # ───────────────────────────────
 # Color Charts & Reference Values
@@ -296,15 +332,29 @@ def process_image_and_get_pods(image_path, model, device):
     p1_mean_ui = masked_median_rgb(wb_np, eroded_mask((mask == POD1_IDX)))
     p2_mean_ui = masked_median_rgb(wb_np, eroded_mask((mask == POD2_IDX)))
 
-    c1 = get_calibrated_value(tuple(p1_mean_raw), 'creatinine')
-    c2 = get_calibrated_value(tuple(p2_mean_raw), 'microalbumin')
-    uacr_value, uacr_category = calculate_uacr_and_category(c2, c1)
+    c1 = get_calibrated_value(tuple(p1_mean_ui), 'creatinine')
+    c2 = get_calibrated_value(tuple(p2_mean_ui), 'microalbumin')
+
+    c1_snapped, _ = apply_low_end_snap('creatinine', tuple(p1_mean_ui), c1)
+    c2_snapped, _ = apply_low_end_snap('microalbumin', tuple(p2_mean_ui), c2)
+
+    uacr_value, uacr_category = calculate_uacr_and_category(c2_snapped, c1_snapped)
 
     out_dir = os.path.join(os.path.dirname(__file__), 'static', 'uploads')
     os.makedirs(out_dir, exist_ok=True)
     fname = f"{os.path.splitext(os.path.basename(image_path))[0]}_{uuid.uuid4().hex[:6]}.png"
     fpath = os.path.join(out_dir, fname)
     
-    save_composite_visual(raw_np, None, None, p1_mean_raw, p2_mean_raw, c1, c2, uacr_category, fpath)
+    save_composite_visual(
+        raw_np,
+        None,
+        None,
+        p1_mean_raw,
+        p2_mean_raw,
+        c1_snapped,
+        c2_snapped,
+        uacr_category,
+        fpath,
+    )
     
     return {'composite_img': fname, 'uacr_category': uacr_category}
