@@ -258,7 +258,7 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
 
     patch1 = np.ones((50, 50, 3), np.uint8) * p1_mean_raw.reshape(1, 1, 3)
     disp1 = find_closest_reference_value_label(calibrated_p1, 'pod1')
-    axs[1].imshow(patch1); axs[1].axis('off'); axs[1].set_title(f"Creatinine\n{disp1}\nRGB{tuple(p1_mean_raw)}")
+    axs[1].imshow(patch1); axs[1].axis('off'); axs[1].set_title(f"Creatinine\n{disp1} mg/dL\nRGB{tuple(p1_mean_raw)}")
 
     patch2 = np.ones((50, 50, 3), np.uint8) * p2_mean_raw.reshape(1, 1, 3)
     lab_obs = _rgb_to_lab_triplet(tuple(p2_mean_raw))
@@ -272,7 +272,7 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
         reg_de = float('inf')
 
     disp2 = color_lbl if (color_de <= MICRO_DELTAE_ACCEPT) and ((reg_de - color_de) > MICRO_DELTAE_MARGIN) else reg_lbl
-    axs[2].imshow(patch2); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2}\nRGB{tuple(p2_mean_raw)}")
+    axs[2].imshow(patch2); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2} mg/L\nRGB{tuple(p2_mean_raw)}")
 
     if uacr_category:
         color = 'darkgreen' if 'A1' in uacr_category else '#D98E04' if 'A2' in uacr_category else 'darkred'
@@ -281,7 +281,7 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
             formatted_text = uacr_category[:paren_pos].strip() + '\n' + uacr_category[paren_pos:]
         except ValueError:
             formatted_text = uacr_category
-        fig.suptitle(f"UACR Result\n{formatted_text}", fontsize=12, fontweight='bold', color=color, y=0.92)
+        fig.suptitle(f"UACR Result\n{formatted_text} mg/Gm", fontsize=12, fontweight='bold', color=color, y=0.92)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.88])
     try:
