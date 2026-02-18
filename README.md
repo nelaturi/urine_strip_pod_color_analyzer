@@ -1,5 +1,5 @@
 
-# Urine Strip Pod Color Analyzer (V2)
+# Urine Strip Pod Color Analyzer (V3)
 
 A Flask web application powered by a deep learning model to identify and analyze the color of pods in urine test strips. The system automatically detects Creatinine and Microalbumin pods in uploaded strip images.
 
@@ -51,8 +51,8 @@ urine_strip_pod_color_analyzer/
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/nelaturi/urine_strip_pod_color_analyzer_V2.git
-cd urine_strip_pod_color_analyzer_V2
+git clone https://github.com/nelaturi/urine_strip_pod_color_analyzer_V3.git
+cd urine_strip_pod_color_analyzer_V3
 ```
 
 ### 2. Setup Environment (Anaconda Recommended)
