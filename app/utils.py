@@ -251,7 +251,7 @@ def find_closest_reference_value_label(val, pod_type):
 def save_composite_visual(raw_img, pod1_region, pod2_region,
                           p1_mean_raw, p2_mean_raw,
                           calibrated_p1, calibrated_p2,
-                          uacr_category,
+                          uacr_display,
                           save_path):
     fig, axs = plt.subplots(1, 3, figsize=(9, 5))
     axs[0].imshow(raw_img); axs[0].axis('off'); axs[0].set_title('Original')
@@ -274,16 +274,11 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
     disp2 = color_lbl if (color_de <= MICRO_DELTAE_ACCEPT) and ((reg_de - color_de) > MICRO_DELTAE_MARGIN) else reg_lbl
     axs[2].imshow(patch2); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2} mg/L\nRGB{tuple(p2_mean_raw)}")
 
-    if uacr_category:
-        color = 'darkgreen' if 'A1' in uacr_category else '#D98E04' if 'A2' in uacr_category else 'darkred'
-        try:
-            paren_pos = uacr_category.index('(')
-            formatted_text = uacr_category[:paren_pos].strip() + '\n' + uacr_category[paren_pos:]
-        except ValueError:
-            formatted_text = uacr_category
-        fig.suptitle(f"UACR Result\n{formatted_text} mg/Gm", fontsize=12, fontweight='bold', color=color, y=0.92)
+    if uacr_display:
+        color = 'darkgreen' if 'A1' in uacr_display else '#D98E04' if 'A2' in uacr_display else 'darkred'
+        fig.suptitle(f"UACR Result\n{uacr_display}", fontsize=11, fontweight='bold', color=color, y=0.97)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.88])
+    plt.tight_layout(rect=[0, 0.03, 1, 0.82])
     try:
         plt.savefig(save_path, bbox_inches='tight', dpi=150)
     finally:
@@ -295,15 +290,28 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
 
 def calculate_uacr_and_category(albumin_mg_l, creatinine_mg_dl):
     if albumin_mg_l is None or creatinine_mg_dl is None or creatinine_mg_dl <= 0:
-        return None, "Indeterminate: One or both values could not be calculated."
+        return None, "Indeterminate", "Unavailable", "Indeterminate: One or both values could not be calculated."
+
     uacr = 100.0 * albumin_mg_l / creatinine_mg_dl
+    uacr_rounded = round(uacr, 2)
+
     if uacr < 30:
-        category = "A1 Proteinuria: < 30 mg/G (healthy range, don’t require treatment)"
+        stage = "A1 Proteinuria"
+        reference_range = "< 30 mg/G"
     elif 30 <= uacr <= 300:
-        category = "A2 Proteinuria: 30 - 300 mg/G (early Kidney Disease, moderate increased risk, \nrequires lifestyle modification and regular follow-up)"
+        stage = "A2 Proteinuria"
+        reference_range = "30 - 300 mg/G"
     else:
-        category = "A3 Proteinuria: > 300 mg/G (severe risk, advanced kidney disease, requires evaluation, treatment)"
-    return round(uacr, 2), category
+        stage = "A3 Proteinuria"
+        reference_range = "> 300 mg/G"
+
+    display_text = (
+        f"{stage}\n"
+        f"Value: {uacr_rounded:.2f} mg/G\n"
+        f"Reference Range: {reference_range}"
+    )
+
+    return uacr_rounded, stage, reference_range, display_text
 
 # ───────────────────────────────
 # Main Inference
@@ -338,7 +346,7 @@ def process_image_and_get_pods(image_path, model, device):
     c1_snapped, _ = apply_low_end_snap('creatinine', tuple(p1_mean_ui), c1)
     c2_snapped, _ = apply_low_end_snap('microalbumin', tuple(p2_mean_ui), c2)
 
-    uacr_value, uacr_category = calculate_uacr_and_category(c2_snapped, c1_snapped)
+    uacr_value, uacr_stage, uacr_range, uacr_display = calculate_uacr_and_category(c2_snapped, c1_snapped)
 
     out_dir = os.path.join(os.path.dirname(__file__), 'static', 'uploads')
     os.makedirs(out_dir, exist_ok=True)
@@ -353,8 +361,14 @@ def process_image_and_get_pods(image_path, model, device):
         p2_mean_raw,
         c1_snapped,
         c2_snapped,
-        uacr_category,
+        uacr_display,
         fpath,
     )
     
-    return {'composite_img': fname, 'uacr_category': uacr_category}
+    return {
+        'composite_img': fname,
+        'uacr_value': uacr_value,
+        'uacr_category': uacr_display,
+        'uacr_stage': uacr_stage,
+        'uacr_reference_range': uacr_range,
+    }
