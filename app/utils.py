@@ -313,6 +313,15 @@ def calculate_uacr_and_category(albumin_mg_l, creatinine_mg_dl):
 
     return uacr_rounded, stage, reference_range, display_text
 
+
+def build_uacr_trace(albumin_used_mg_l, creatinine_used_mg_dl, uacr_value, source_tag):
+    return {
+        'albumin_used_mg_l': None if albumin_used_mg_l is None else round(float(albumin_used_mg_l), 4),
+        'creatinine_used_mg_dl': None if creatinine_used_mg_dl is None else round(float(creatinine_used_mg_dl), 4),
+        'uacr_formula_mg_g': uacr_value,
+        'source': source_tag,
+    }
+
 # ───────────────────────────────
 # Main Inference
 # ───────────────────────────────
@@ -346,7 +355,19 @@ def process_image_and_get_pods(image_path, model, device):
     c1_snapped, _ = apply_low_end_snap('creatinine', tuple(p1_mean_ui), c1)
     c2_snapped, _ = apply_low_end_snap('microalbumin', tuple(p2_mean_ui), c2)
 
+    # Preserve legacy behavior trace (continuous calibrated values) and corrected
+    # behavior trace (snapped/displayed values) to avoid disruption in existing flow.
+    uacr_legacy_value, _, _, _ = calculate_uacr_and_category(c2, c1)
     uacr_value, uacr_stage, uacr_range, uacr_display = calculate_uacr_and_category(c2_snapped, c1_snapped)
+    uacr_delta = None if (uacr_legacy_value is None or uacr_value is None) else round(uacr_legacy_value - uacr_value, 2)
+
+    if uacr_delta is not None and abs(uacr_delta) > 1.0:
+        logging.warning(
+            "UACR consistency warning: legacy/calibrated=%.2f, corrected/snapped=%.2f, delta=%.2f",
+            uacr_legacy_value,
+            uacr_value,
+            uacr_delta,
+        )
 
     out_dir = os.path.join(os.path.dirname(__file__), 'static', 'uploads')
     os.makedirs(out_dir, exist_ok=True)
@@ -367,8 +388,15 @@ def process_image_and_get_pods(image_path, model, device):
     
     return {
         'composite_img': fname,
+        # Corrected value aligned to displayed snapped analyte values.
         'uacr_value': uacr_value,
         'uacr_category': uacr_display,
         'uacr_stage': uacr_stage,
         'uacr_reference_range': uacr_range,
+        # Traceability fields to preserve legacy vs corrected outputs.
+        'uacr_legacy_value': uacr_legacy_value,
+        'uacr_corrected_value': uacr_value,
+        'uacr_delta_legacy_minus_corrected': uacr_delta,
+        'uacr_legacy_trace': build_uacr_trace(c2, c1, uacr_legacy_value, 'legacy_calibrated_continuous'),
+        'uacr_corrected_trace': build_uacr_trace(c2_snapped, c1_snapped, uacr_value, 'corrected_snapped_displayed'),
     }

@@ -98,6 +98,44 @@
           <i class="bi bi-download me-2"></i> <span>Download Summary</span>
         </a>
       </div>
+
+      {% if result %}
+      <div class="mt-4 text-start">
+        <h5 class="mb-3">UACR Traceability</h5>
+        <div class="table-responsive">
+          <table class="table table-sm table-bordered align-middle">
+            <thead class="table-light">
+              <tr>
+                <th>Metric</th>
+                <th>Legacy (calibrated)</th>
+                <th>Corrected (display-snapped)</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Albumin used (mg/L)</td>
+                <td>{{ result.uacr_legacy_trace.albumin_used_mg_l if result.uacr_legacy_trace else 'NA' }}</td>
+                <td>{{ result.uacr_corrected_trace.albumin_used_mg_l if result.uacr_corrected_trace else 'NA' }}</td>
+              </tr>
+              <tr>
+                <td>Creatinine used (mg/dL)</td>
+                <td>{{ result.uacr_legacy_trace.creatinine_used_mg_dl if result.uacr_legacy_trace else 'NA' }}</td>
+                <td>{{ result.uacr_corrected_trace.creatinine_used_mg_dl if result.uacr_corrected_trace else 'NA' }}</td>
+              </tr>
+              <tr>
+                <td>UACR value (mg/g)</td>
+                <td>{{ result.uacr_legacy_value if result.uacr_legacy_value is not none else 'NA' }}</td>
+                <td><strong>{{ result.uacr_corrected_value if result.uacr_corrected_value is not none else 'NA' }}</strong></td>
+              </tr>
+              <tr>
+                <td>Legacy - Corrected delta</td>
+                <td colspan="2">{{ result.uacr_delta_legacy_minus_corrected if result.uacr_delta_legacy_minus_corrected is not none else 'NA' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {% endif %}
     </div>
   </div>
   {% endif %}
