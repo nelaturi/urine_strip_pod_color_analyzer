@@ -41,6 +41,42 @@ LOW_END_THRESHOLDS = {
 }
 CREATININE_DELTAE_ACCEPT = 8.0  # accept creatinine centroid if best ΔE <= this
 
+# Post-extraction quality-control thresholds
+QUALITY_THRESHOLDS = {
+    'sigma_l': 14.0,
+    'mad_ab': 7.0,
+    'de_p90': 14.0,
+    'texture_score': 16.0,
+    'glare_v_high': 245,
+    'glare_s_low': 45,
+    'glare_l_high': 92.0,
+    'glare_area_ratio': 0.04,
+    'glare_cluster_ratio': 0.02,
+    'glare_spot_count': 2,
+    'mask_area_min': 0.002,
+    'mask_area_max': 0.20,
+    'edge_touch_ratio': 0.15,
+    'eccentricity_max': 0.98,
+}
+
+CONFIDENCE_WEIGHTS = {
+    'non_uniform': 0.45,
+    'glare': 0.35,
+    'mask': 0.20,
+}
+
+SOFT_HARD_THRESHOLDS = {
+    'de_soft': 10.0,
+    'de_hard': 22.0,
+    'ga_soft': 0.01,
+    'ga_hard': 0.08,
+}
+
+HYSTERESIS_BAND = {
+    'pod1': 10.0,   # mg/dL
+    'pod2': 20.0,   # mg/L
+}
+
 # Preprocessing pipeline (keep model input unchanged)
 val_tf = A.Compose([
     A.Resize(256, 256),
@@ -148,6 +184,255 @@ def masked_median_rgb(img_uint8, mask_bool):
     med = np.median(pix, axis=0).round().astype(np.uint8)
     return med
 
+def _clamp(val, lo=0.0, hi=1.0):
+    return max(lo, min(hi, float(val)))
+
+def _compute_mask_quality(mask_bool, image_shape_hw, thresholds):
+    h, w = image_shape_hw
+    pod_area = int(mask_bool.sum())
+    total_area = float(h * w)
+    area_ratio = (pod_area / total_area) if total_area > 0 else 0.0
+
+    ys, xs = np.where(mask_bool)
+    if len(xs) == 0:
+        return {
+            'mask_area_ratio': 0.0,
+            'edge_touch_ratio': 1.0,
+            'eccentricity': 1.0,
+            'flag_mask_quality': 1,
+            'mask_quality_reasons': ['empty_mask'],
+        }
+
+    edge_hits = int(((ys == 0) | (ys == h - 1) | (xs == 0) | (xs == w - 1)).sum())
+    edge_touch_ratio = edge_hits / max(pod_area, 1)
+
+    mask_u8 = mask_bool.astype(np.uint8)
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    eccentricity = 0.0
+    if contours and len(contours[0]) >= 5:
+        (_, _), (maj, minr), _ = cv2.fitEllipse(max(contours, key=cv2.contourArea))
+        major = max(maj, minr)
+        minor = max(min(maj, minr), 1e-6)
+        eccentricity = np.sqrt(max(0.0, 1.0 - (minor * minor) / (major * major)))
+
+    reasons = []
+    if area_ratio < thresholds['mask_area_min']:
+        reasons.append('mask_too_small')
+    if area_ratio > thresholds['mask_area_max']:
+        reasons.append('mask_too_large')
+    if edge_touch_ratio > thresholds['edge_touch_ratio']:
+        reasons.append('mask_touches_border')
+    if eccentricity > thresholds['eccentricity_max']:
+        reasons.append('mask_extreme_eccentricity')
+
+    return {
+        'mask_area_ratio': round(area_ratio, 6),
+        'edge_touch_ratio': round(edge_touch_ratio, 6),
+        'eccentricity': round(float(eccentricity), 6),
+        'flag_mask_quality': 1 if reasons else 0,
+        'mask_quality_reasons': reasons,
+    }
+
+def _compute_quality_metrics(img_rgb_uint8, mask_bool):
+    if not mask_bool.any():
+        return {
+            'sigma_L': 0.0,
+            'mad_ab': 0.0,
+            'de_p90': 0.0,
+            'texture_score': 0.0,
+            'glare_area_ratio': 0.0,
+            'glare_cluster_max_ratio': 0.0,
+            'white_spot_count': 0,
+            'glare_pixels': 0,
+        }
+
+    lab = rgb2lab(img_rgb_uint8)
+    l_channel = lab[..., 0]
+    a_channel = lab[..., 1]
+    b_channel = lab[..., 2]
+
+    l_vals = l_channel[mask_bool]
+    a_vals = a_channel[mask_bool]
+    b_vals = b_channel[mask_bool]
+    chroma_vals = np.sqrt(a_vals * a_vals + b_vals * b_vals)
+
+    sigma_l = float(np.std(l_vals))
+    mad_ab = float(np.median(np.abs(chroma_vals - np.median(chroma_vals))))
+
+    med_l, med_a, med_b = np.median(l_vals), np.median(a_vals), np.median(b_vals)
+    de_vals = np.sqrt((l_vals - med_l) ** 2 + (a_vals - med_a) ** 2 + (b_vals - med_b) ** 2)
+    de_p90 = float(np.percentile(de_vals, 90))
+
+    gray = cv2.cvtColor(img_rgb_uint8, cv2.COLOR_RGB2GRAY)
+    local_mean = cv2.GaussianBlur(gray.astype(np.float32), (0, 0), sigmaX=1.2)
+    local_sq_mean = cv2.GaussianBlur((gray.astype(np.float32) ** 2), (0, 0), sigmaX=1.2)
+    local_std = np.sqrt(np.maximum(local_sq_mean - local_mean ** 2, 0))
+    texture_score = float(np.median(local_std[mask_bool]))
+
+    hsv = cv2.cvtColor(img_rgb_uint8, cv2.COLOR_RGB2HSV)
+    h_ch, s_ch, v_ch = cv2.split(hsv)
+    _ = h_ch  # Explicitly unused
+    glare_candidates = (
+        ((v_ch >= QUALITY_THRESHOLDS['glare_v_high']) & (s_ch <= QUALITY_THRESHOLDS['glare_s_low'])) |
+        (l_channel >= QUALITY_THRESHOLDS['glare_l_high'])
+    ) & mask_bool
+
+    glare_u8 = glare_candidates.astype(np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(glare_u8, connectivity=8)
+    min_blob_area = 3
+    glare_pixels = 0
+    spot_count = 0
+    largest_blob = 0
+    for idx in range(1, n_labels):
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area >= min_blob_area:
+            glare_pixels += area
+            spot_count += 1
+            largest_blob = max(largest_blob, area)
+
+    pod_pixels = int(mask_bool.sum())
+    glare_area_ratio = glare_pixels / max(pod_pixels, 1)
+    glare_cluster_ratio = largest_blob / max(pod_pixels, 1)
+
+    return {
+        'sigma_L': round(sigma_l, 4),
+        'mad_ab': round(mad_ab, 4),
+        'de_p90': round(de_p90, 4),
+        'texture_score': round(texture_score, 4),
+        'glare_area_ratio': round(float(glare_area_ratio), 6),
+        'glare_cluster_max_ratio': round(float(glare_cluster_ratio), 6),
+        'white_spot_count': int(spot_count),
+        'glare_pixels': int(glare_pixels),
+    }
+
+def _derive_quality_flags(metrics, mask_quality, thresholds):
+    non_uniform_votes = 0
+    non_uniform_votes += int(metrics['sigma_L'] > thresholds['sigma_l'])
+    non_uniform_votes += int(metrics['mad_ab'] > thresholds['mad_ab'])
+    non_uniform_votes += int(metrics['de_p90'] > thresholds['de_p90'])
+    non_uniform_votes += int(metrics['texture_score'] > thresholds['texture_score'])
+
+    flag_non_uniform = 1 if non_uniform_votes >= 2 else 0
+    flag_glare = 1 if (
+        metrics['glare_area_ratio'] > thresholds['glare_area_ratio'] or
+        metrics['glare_cluster_max_ratio'] > thresholds['glare_cluster_ratio'] or
+        metrics['white_spot_count'] > thresholds['glare_spot_count']
+    ) else 0
+    flag_mask_quality = int(mask_quality['flag_mask_quality'])
+
+    return {
+        'flag_non_uniform': flag_non_uniform,
+        'flag_glare': flag_glare,
+        'flag_mask_quality': flag_mask_quality,
+    }
+
+def _confidence_from_quality(metrics, flags):
+    p_non_uniform = _clamp(
+        (metrics['de_p90'] - SOFT_HARD_THRESHOLDS['de_soft']) /
+        max(SOFT_HARD_THRESHOLDS['de_hard'] - SOFT_HARD_THRESHOLDS['de_soft'], 1e-6)
+    )
+    p_glare = _clamp(
+        (metrics['glare_area_ratio'] - SOFT_HARD_THRESHOLDS['ga_soft']) /
+        max(SOFT_HARD_THRESHOLDS['ga_hard'] - SOFT_HARD_THRESHOLDS['ga_soft'], 1e-6)
+    )
+    p_mask = 1.0 if flags['flag_mask_quality'] else 0.0
+
+    penalty = (
+        CONFIDENCE_WEIGHTS['non_uniform'] * p_non_uniform +
+        CONFIDENCE_WEIGHTS['glare'] * p_glare +
+        CONFIDENCE_WEIGHTS['mask'] * p_mask
+    )
+    confidence = _clamp(1.0 - penalty)
+
+    if confidence >= 0.85:
+        bucket = 'High'
+    elif confidence >= 0.65:
+        bucket = 'Moderate'
+    else:
+        bucket = 'Low'
+
+    return {
+        'confidence': round(confidence, 4),
+        'confidence_pct': round(confidence * 100.0, 1),
+        'confidence_bucket': bucket,
+        'penalties': {
+            'p_non_uniform': round(p_non_uniform, 4),
+            'p_glare': round(p_glare, 4),
+            'p_mask': round(p_mask, 4),
+        }
+    }
+
+def _estimate_from_chart(pod_type, rgb_obs):
+    lab_obs = _rgb_to_lab_triplet(tuple(map(int, rgb_obs)))
+    if pod_type == 'creatinine':
+        label, _ = nearest_creatinine_centroid_lab(lab_obs)
+        return _creatinine_label_to_value(label), label
+    label, _ = nearest_micro_centroid_lab(lab_obs)
+    return float(label) if label is not None else None, label
+
+def _snap_with_hysteresis(value, confidence, pod_type):
+    if value is None:
+        return None, None, None
+    refs = sorted(REFERENCE_VALUES[pod_type].values())
+    nearest = min(refs, key=lambda v: abs(v - value))
+    boundary_dist = min([abs(value - b) for b in refs]) if refs else float('inf')
+    snapped = nearest
+    if confidence < 0.65 and boundary_dist < HYSTERESIS_BAND[pod_type]:
+        # Safer behavior under low confidence near boundaries: avoid upward jump.
+        lower_or_equal = [v for v in refs if v <= value]
+        snapped = max(lower_or_equal) if lower_or_equal else nearest
+    return snapped, boundary_dist, nearest
+
+def _apply_quality_corrections(pod_type, v_reg, v_color, conf_data, flags, metrics):
+    conf = conf_data['confidence']
+    v_reg_use = v_reg if v_reg is not None else v_color
+    v_color_use = v_color if v_color is not None else v_reg_use
+    if v_reg_use is None:
+        return {
+            'raw_regression': None,
+            'raw_color_chart': None,
+            'fused': None,
+            'corrected': None,
+            'snapped': None,
+            'alpha': 0.0,
+            'correction_reason': 'No value available for correction',
+            'boundary_distance': None,
+        }
+
+    v_fused = conf * float(v_reg_use) + (1.0 - conf) * float(v_color_use)
+
+    severity = 0.0
+    if flags['flag_non_uniform']:
+        severity += 0.5
+    if flags['flag_glare']:
+        severity += 0.5
+    severity += 0.3 * conf_data['penalties']['p_mask']
+    severity = _clamp(severity, 0.0, 1.0)
+    alpha = 0.08 * severity
+
+    v_corrected = v_fused * (1.0 - alpha)
+    snapped, boundary_dist, _ = _snap_with_hysteresis(v_corrected, conf, 'pod1' if pod_type == 'creatinine' else 'pod2')
+
+    reasons = []
+    if flags['flag_non_uniform']:
+        reasons.append(f"non-uniformity (de_p90={metrics['de_p90']})")
+    if flags['flag_glare']:
+        reasons.append(f"glare ratio={metrics['glare_area_ratio']}")
+    if flags['flag_mask_quality']:
+        reasons.append('mask quality issue')
+    reason = '; '.join(reasons) if reasons else 'No correction required'
+
+    return {
+        'raw_regression': None if v_reg is None else round(float(v_reg), 4),
+        'raw_color_chart': None if v_color is None else round(float(v_color), 4),
+        'fused': round(float(v_fused), 4),
+        'corrected': round(float(v_corrected), 4),
+        'snapped': None if snapped is None else round(float(snapped), 4),
+        'alpha': round(float(alpha), 4),
+        'correction_reason': reason,
+        'boundary_distance': None if boundary_dist is None else round(float(boundary_dist), 4),
+    }
+
 # ───────────────────────────────
 # Nearest-centroid utilities (Lab)
 # ───────────────────────────────
@@ -252,13 +537,19 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
                           p1_mean_raw, p2_mean_raw,
                           calibrated_p1, calibrated_p2,
                           uacr_display,
-                          save_path):
+                          save_path,
+                          pod_quality=None,
+                          uacr_confidence=None):
     fig, axs = plt.subplots(1, 3, figsize=(9, 5))
     axs[0].imshow(raw_img); axs[0].axis('off'); axs[0].set_title('Original')
 
     patch1 = np.ones((50, 50, 3), np.uint8) * p1_mean_raw.reshape(1, 1, 3)
     disp1 = find_closest_reference_value_label(calibrated_p1, 'pod1')
-    axs[1].imshow(patch1); axs[1].axis('off'); axs[1].set_title(f"Creatinine\n{disp1} mg/dL\nRGB{tuple(p1_mean_raw)}")
+    p1_quality_suffix = ""
+    if pod_quality and pod_quality.get('creatinine'):
+        q = pod_quality['creatinine']
+        p1_quality_suffix = f"\nConf {q.get('confidence_pct', 'NA')}% ({q.get('confidence_bucket', 'NA')})"
+    axs[1].imshow(patch1); axs[1].axis('off'); axs[1].set_title(f"Creatinine\n{disp1} mg/dL\nRGB{tuple(p1_mean_raw)}{p1_quality_suffix}")
 
     patch2 = np.ones((50, 50, 3), np.uint8) * p2_mean_raw.reshape(1, 1, 3)
     lab_obs = _rgb_to_lab_triplet(tuple(p2_mean_raw))
@@ -272,11 +563,16 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
         reg_de = float('inf')
 
     disp2 = color_lbl if (color_de <= MICRO_DELTAE_ACCEPT) and ((reg_de - color_de) > MICRO_DELTAE_MARGIN) else reg_lbl
-    axs[2].imshow(patch2); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2} mg/L\nRGB{tuple(p2_mean_raw)}")
+    p2_quality_suffix = ""
+    if pod_quality and pod_quality.get('microalbumin'):
+        q = pod_quality['microalbumin']
+        p2_quality_suffix = f"\nConf {q.get('confidence_pct', 'NA')}% ({q.get('confidence_bucket', 'NA')})"
+    axs[2].imshow(patch2); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2} mg/L\nRGB{tuple(p2_mean_raw)}{p2_quality_suffix}")
 
     if uacr_display:
         color = 'darkgreen' if 'A1' in uacr_display else '#D98E04' if 'A2' in uacr_display else 'darkred'
-        fig.suptitle(f"UACR Result\n{uacr_display}", fontsize=11, fontweight='bold', color=color, y=0.97)
+        conf_text = f"\nEvidence confidence: {uacr_confidence}%" if uacr_confidence is not None else ""
+        fig.suptitle(f"UACR Result\n{uacr_display}{conf_text}", fontsize=11, fontweight='bold', color=color, y=0.97)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.82])
     try:
@@ -349,17 +645,45 @@ def process_image_and_get_pods(image_path, model, device):
     p1_mean_ui = masked_median_rgb(wb_np, eroded_mask((mask == POD1_IDX)))
     p2_mean_ui = masked_median_rgb(wb_np, eroded_mask((mask == POD2_IDX)))
 
+    pod1_mask = (mask == POD1_IDX)
+    pod2_mask = (mask == POD2_IDX)
+    pod1_eroded = eroded_mask(pod1_mask)
+    pod2_eroded = eroded_mask(pod2_mask)
+
+    pod1_mask_quality = _compute_mask_quality(pod1_mask, raw_np.shape[:2], QUALITY_THRESHOLDS)
+    pod2_mask_quality = _compute_mask_quality(pod2_mask, raw_np.shape[:2], QUALITY_THRESHOLDS)
+    pod1_metrics = _compute_quality_metrics(wb_np, pod1_eroded)
+    pod2_metrics = _compute_quality_metrics(wb_np, pod2_eroded)
+    pod1_flags = _derive_quality_flags(pod1_metrics, pod1_mask_quality, QUALITY_THRESHOLDS)
+    pod2_flags = _derive_quality_flags(pod2_metrics, pod2_mask_quality, QUALITY_THRESHOLDS)
+    pod1_conf = _confidence_from_quality(pod1_metrics, pod1_flags)
+    pod2_conf = _confidence_from_quality(pod2_metrics, pod2_flags)
+
     c1 = get_calibrated_value(tuple(p1_mean_ui), 'creatinine')
     c2 = get_calibrated_value(tuple(p2_mean_ui), 'microalbumin')
+    c1_color, c1_color_label = _estimate_from_chart('creatinine', tuple(p1_mean_ui))
+    c2_color, c2_color_label = _estimate_from_chart('microalbumin', tuple(p2_mean_ui))
 
-    c1_snapped, _ = apply_low_end_snap('creatinine', tuple(p1_mean_ui), c1)
-    c2_snapped, _ = apply_low_end_snap('microalbumin', tuple(p2_mean_ui), c2)
+    c1_quality_trace = _apply_quality_corrections('creatinine', c1, c1_color, pod1_conf, pod1_flags, pod1_metrics)
+    c2_quality_trace = _apply_quality_corrections('microalbumin', c2, c2_color, pod2_conf, pod2_flags, pod2_metrics)
+
+    c1_pre_snap = c1_quality_trace['snapped'] if c1_quality_trace['snapped'] is not None else c1
+    c2_pre_snap = c2_quality_trace['snapped'] if c2_quality_trace['snapped'] is not None else c2
+
+    c1_snapped, c1_low_end_label = apply_low_end_snap('creatinine', tuple(p1_mean_ui), c1_pre_snap)
+    c2_snapped, c2_low_end_label = apply_low_end_snap('microalbumin', tuple(p2_mean_ui), c2_pre_snap)
 
     # Preserve legacy behavior trace (continuous calibrated values) and corrected
     # behavior trace (snapped/displayed values) to avoid disruption in existing flow.
     uacr_legacy_value, _, _, _ = calculate_uacr_and_category(c2, c1)
     uacr_value, uacr_stage, uacr_range, uacr_display = calculate_uacr_and_category(c2_snapped, c1_snapped)
+    uacr_confidence = round(min(pod1_conf['confidence'], pod2_conf['confidence']) * 100.0, 1)
+    uacr_conf_bucket = 'High' if uacr_confidence >= 85 else 'Moderate' if uacr_confidence >= 65 else 'Low'
     uacr_delta = None if (uacr_legacy_value is None or uacr_value is None) else round(uacr_legacy_value - uacr_value, 2)
+    legacy_stage = calculate_uacr_and_category(c2, c1)[1]
+    stage_adjustment_reason = None
+    if legacy_stage != uacr_stage:
+        stage_adjustment_reason = "Stage adjusted due to low evidence confidence"
 
     if uacr_delta is not None and abs(uacr_delta) > 1.0:
         logging.warning(
@@ -384,6 +708,11 @@ def process_image_and_get_pods(image_path, model, device):
         c2_snapped,
         uacr_display,
         fpath,
+        pod_quality={
+            'creatinine': pod1_conf,
+            'microalbumin': pod2_conf,
+        },
+        uacr_confidence=uacr_confidence,
     )
     
     return {
@@ -399,4 +728,41 @@ def process_image_and_get_pods(image_path, model, device):
         'uacr_delta_legacy_minus_corrected': uacr_delta,
         'uacr_legacy_trace': build_uacr_trace(c2, c1, uacr_legacy_value, 'legacy_calibrated_continuous'),
         'uacr_corrected_trace': build_uacr_trace(c2_snapped, c1_snapped, uacr_value, 'corrected_snapped_displayed'),
+        # Quality and confidence payload for on-screen evidence display.
+        'pod_quality': {
+            'creatinine': {
+                **pod1_conf,
+                **pod1_flags,
+                **pod1_metrics,
+                **pod1_mask_quality,
+                'trace': c1_quality_trace,
+                'raw_regression_value': c1,
+                'raw_color_chart_value': c1_color,
+                'raw_color_chart_label': c1_color_label,
+                'final_display_value': c1_snapped,
+                'low_end_snap_label': c1_low_end_label,
+            },
+            'microalbumin': {
+                **pod2_conf,
+                **pod2_flags,
+                **pod2_metrics,
+                **pod2_mask_quality,
+                'trace': c2_quality_trace,
+                'raw_regression_value': c2,
+                'raw_color_chart_value': c2_color,
+                'raw_color_chart_label': c2_color_label,
+                'final_display_value': c2_snapped,
+                'low_end_snap_label': c2_low_end_label,
+            },
+        },
+        'uacr_confidence_pct': uacr_confidence,
+        'uacr_confidence_bucket': uacr_conf_bucket,
+        'uacr_stage_adjustment_reason': stage_adjustment_reason,
+        'uacr_trace_quality': {
+            'legacy_stage': legacy_stage,
+            'corrected_stage': uacr_stage,
+            'raw_formula_value': uacr_legacy_value,
+            'corrected_formula_value': uacr_value,
+            'uacr_confidence_pct': uacr_confidence,
+        },
     }

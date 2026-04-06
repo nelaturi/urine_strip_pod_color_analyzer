@@ -102,6 +102,52 @@
       {% if result %}
       <div class="mt-4 text-start">
         <h5 class="mb-3">UACR Traceability</h5>
+        <div class="alert {% if result.uacr_confidence_bucket == 'High' %}alert-success{% elif result.uacr_confidence_bucket == 'Moderate' %}alert-warning{% else %}alert-danger{% endif %} py-2">
+          <strong>Evidence Confidence:</strong> {{ result.uacr_confidence_pct }}% ({{ result.uacr_confidence_bucket }})
+          {% if result.uacr_stage_adjustment_reason %}
+          <br><small>{{ result.uacr_stage_adjustment_reason }}</small>
+          {% endif %}
+        </div>
+
+        {% if result.pod_quality %}
+        <div class="row g-3 mb-3">
+          <div class="col-md-6">
+            <div class="card h-100">
+              <div class="card-body">
+                <h6 class="card-title">Creatinine Pod</h6>
+                <p class="mb-1"><strong>Value:</strong> {{ result.pod_quality.creatinine.final_display_value }} mg/dL</p>
+                <p class="mb-1"><strong>Confidence:</strong> {{ result.pod_quality.creatinine.confidence_pct }}% ({{ result.pod_quality.creatinine.confidence_bucket }})</p>
+                <p class="mb-1"><strong>Flags:</strong>
+                  {% set c_flags = [] %}
+                  {% if result.pod_quality.creatinine.flag_non_uniform %}{% set _ = c_flags.append('Non-uniformity') %}{% endif %}
+                  {% if result.pod_quality.creatinine.flag_glare %}{% set _ = c_flags.append('Glare') %}{% endif %}
+                  {% if result.pod_quality.creatinine.flag_mask_quality %}{% set _ = c_flags.append('Mask quality') %}{% endif %}
+                  {{ c_flags|join(', ') if c_flags else 'None' }}
+                </p>
+                <p class="mb-0"><strong>Correction:</strong> -{{ (result.pod_quality.creatinine.trace.alpha * 100)|round(2) }}% ({{ result.pod_quality.creatinine.trace.correction_reason }})</p>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <div class="card h-100">
+              <div class="card-body">
+                <h6 class="card-title">Microalbumin Pod</h6>
+                <p class="mb-1"><strong>Value:</strong> {{ result.pod_quality.microalbumin.final_display_value }} mg/L</p>
+                <p class="mb-1"><strong>Confidence:</strong> {{ result.pod_quality.microalbumin.confidence_pct }}% ({{ result.pod_quality.microalbumin.confidence_bucket }})</p>
+                <p class="mb-1"><strong>Flags:</strong>
+                  {% set m_flags = [] %}
+                  {% if result.pod_quality.microalbumin.flag_non_uniform %}{% set _ = m_flags.append('Non-uniformity') %}{% endif %}
+                  {% if result.pod_quality.microalbumin.flag_glare %}{% set _ = m_flags.append('Glare') %}{% endif %}
+                  {% if result.pod_quality.microalbumin.flag_mask_quality %}{% set _ = m_flags.append('Mask quality') %}{% endif %}
+                  {{ m_flags|join(', ') if m_flags else 'None' }}
+                </p>
+                <p class="mb-0"><strong>Correction:</strong> -{{ (result.pod_quality.microalbumin.trace.alpha * 100)|round(2) }}% ({{ result.pod_quality.microalbumin.trace.correction_reason }})</p>
+              </div>
+            </div>
+          </div>
+        </div>
+        {% endif %}
+
         <div class="table-responsive">
           <table class="table table-sm table-bordered align-middle">
             <thead class="table-light">
@@ -126,6 +172,10 @@
                 <td>UACR value (mg/g)</td>
                 <td>{{ result.uacr_legacy_value if result.uacr_legacy_value is not none else 'NA' }}</td>
                 <td><strong>{{ result.uacr_corrected_value if result.uacr_corrected_value is not none else 'NA' }}</strong></td>
+              </tr>
+              <tr>
+                <td>UACR confidence</td>
+                <td colspan="2">{{ result.uacr_confidence_pct if result.uacr_confidence_pct is not none else 'NA' }}% ({{ result.uacr_confidence_bucket if result.uacr_confidence_bucket else 'NA' }})</td>
               </tr>
               <tr>
                 <td>Legacy - Corrected delta</td>
