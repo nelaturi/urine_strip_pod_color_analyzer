@@ -12,3 +12,9 @@ __pycache__/
 *.swp 
 .idea/ 
 .vscode/ 
+
+# Generated export artifacts
+exports/*
+!exports/.gitkeep
+download/*
+!download/.gitkeep
