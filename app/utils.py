@@ -534,25 +534,25 @@ def find_closest_reference_value_label(val, pod_type):
 # ───────────────────────────────
 
 def save_composite_visual(raw_img, pod1_region, pod2_region,
-                          p1_mean_raw, p2_mean_raw,
+                          p1_mean_display, p2_mean_display,
                           calibrated_p1, calibrated_p2,
                           uacr_display,
                           save_path,
                           pod_quality=None,
                           uacr_confidence=None):
     fig, axs = plt.subplots(1, 3, figsize=(9, 5))
-    axs[0].imshow(raw_img); axs[0].axis('off'); axs[0].set_title('Original')
+    axs[0].imshow(raw_img, interpolation='nearest'); axs[0].axis('off'); axs[0].set_title('Original')
 
-    patch1 = np.ones((50, 50, 3), np.uint8) * p1_mean_raw.reshape(1, 1, 3)
+    patch1 = np.ones((50, 50, 3), np.uint8) * p1_mean_display.reshape(1, 1, 3)
     disp1 = find_closest_reference_value_label(calibrated_p1, 'pod1')
     p1_quality_suffix = ""
     if pod_quality and pod_quality.get('creatinine'):
         q = pod_quality['creatinine']
         p1_quality_suffix = f"\nConf {q.get('confidence_pct', 'NA')}% ({q.get('confidence_bucket', 'NA')})"
-    axs[1].imshow(patch1); axs[1].axis('off'); axs[1].set_title(f"Creatinine\n{disp1} mg/dL\nRGB{tuple(p1_mean_raw)}{p1_quality_suffix}")
+    axs[1].imshow(patch1, interpolation='nearest'); axs[1].axis('off'); axs[1].set_title(f"Creatinine\n{disp1} mg/dL\nRGB{tuple(p1_mean_display)}{p1_quality_suffix}")
 
-    patch2 = np.ones((50, 50, 3), np.uint8) * p2_mean_raw.reshape(1, 1, 3)
-    lab_obs = _rgb_to_lab_triplet(tuple(p2_mean_raw))
+    patch2 = np.ones((50, 50, 3), np.uint8) * p2_mean_display.reshape(1, 1, 3)
+    lab_obs = _rgb_to_lab_triplet(tuple(p2_mean_display))
     color_lbl, color_de = nearest_micro_centroid_lab(lab_obs)
     reg_lbl = find_closest_reference_value_label(calibrated_p2, 'pod2')
 
@@ -567,7 +567,7 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
     if pod_quality and pod_quality.get('microalbumin'):
         q = pod_quality['microalbumin']
         p2_quality_suffix = f"\nConf {q.get('confidence_pct', 'NA')}% ({q.get('confidence_bucket', 'NA')})"
-    axs[2].imshow(patch2); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2} mg/L\nRGB{tuple(p2_mean_raw)}{p2_quality_suffix}")
+    axs[2].imshow(patch2, interpolation='nearest'); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2} mg/L\nRGB{tuple(p2_mean_display)}{p2_quality_suffix}")
 
     if uacr_display:
         color = 'darkgreen' if 'A1' in uacr_display else '#D98E04' if 'A2' in uacr_display else 'darkred'
@@ -702,8 +702,8 @@ def process_image_and_get_pods(image_path, model, device):
         raw_np,
         None,
         None,
-        p1_mean_raw,
-        p2_mean_raw,
+        p1_mean_ui,
+        p2_mean_ui,
         c1_snapped,
         c2_snapped,
         uacr_display,
@@ -764,5 +764,15 @@ def process_image_and_get_pods(image_path, model, device):
             'raw_formula_value': uacr_legacy_value,
             'corrected_formula_value': uacr_value,
             'uacr_confidence_pct': uacr_confidence,
+        },
+        'pod_color_trace': {
+            'creatinine': {
+                'raw_mean_rgb': tuple(map(int, p1_mean_raw.tolist())),
+                'display_mean_rgb': tuple(map(int, p1_mean_ui.tolist())),
+            },
+            'microalbumin': {
+                'raw_mean_rgb': tuple(map(int, p2_mean_raw.tolist())),
+                'display_mean_rgb': tuple(map(int, p2_mean_ui.tolist())),
+            },
         },
     }
