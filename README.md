@@ -122,3 +122,20 @@ python run.py
 
 - Developed by Naresh Nelaturi
 - Powered by Flask, PyTorch, Albumentations, and Bootstrap.
+
+## Export full project bundle (manual GitHub push)
+
+To generate downloadable files for:
+1. reproducing the project in VS Code, and
+2. manually pushing the full project history to a new GitHub repository,
+
+run:
+
+```bash
+./tools/export_project_for_manual_github.sh
+```
+
+This generates in `download/`:
+- `<repo>.bundle` (full Git history, all branches/tags)
+- `<repo>-source.zip` (current source snapshot for VS Code)
+- `README_MANUAL_PUSH.md` (copy-paste manual push steps)
