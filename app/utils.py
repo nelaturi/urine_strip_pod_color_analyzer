@@ -40,6 +40,13 @@ LOW_END_THRESHOLDS = {
     'creatinine': 25.0,       # mg/dL
 }
 CREATININE_DELTAE_ACCEPT = 8.0  # accept creatinine centroid if best ΔE <= this
+MICRO_SHADE_PIXEL_DE_ACCEPT = 9.0
+MICRO_SHADE_MEDIAN_LOW_DE_ACCEPT = 8.0
+MICRO_SHADE_ADVANTAGE_MARGIN = 1.5
+MICRO_LOW_SHADE_FRACTION_MIN = 0.50
+MICRO_AQUA_SHADE_FRACTION_MIN = 0.05
+MICRO_AQUA_SHADE_STRONG_FRACTION = 0.12
+MICRO_SHADE_MIN_PIXELS = 50
 
 # Post-extraction quality-control thresholds
 QUALITY_THRESHOLDS = {
@@ -128,6 +135,32 @@ MICROALBUMIN_CENTROIDS = {
     1400: (158.0, 188.0, 192.0),
 }
 
+MICROALBUMIN_LOW_SHADE_REFS = {
+    10: {
+        "rgb": (175, 177, 168),
+        "hex": "#AFB1A8",
+        "visual_name": "very pale grey-green",
+    },
+    30: {
+        "rgb": (175, 178, 165),
+        "hex": "#AFB2A5",
+        "visual_name": "pale yellow-grey-green",
+    },
+}
+
+MICROALBUMIN_AQUA_CONFIRM_REFS = {
+    80: {
+        "rgb": (166, 181, 184),
+        "hex": "#A6B5B8",
+        "visual_name": "pale aqua / blue-grey",
+    },
+    150: {
+        "rgb": (156, 178, 189),
+        "hex": "#9CB2BD",
+        "visual_name": "light aqua-blue / blue-grey",
+    },
+}
+
 # Creatinine (pod1) → added bin 25
 CREATININE_CENTROIDS = {
     "10 (0.1)":  (190, 177, 52), # Updated centroid from new Label 10 dataset
@@ -159,6 +192,208 @@ def _lab_distance(lab1, lab2, wL=0.5):
 
 MICROALBUMIN_CENTROIDS_LAB = {k: _rgb_to_lab_triplet(v) for k, v in MICROALBUMIN_CENTROIDS.items()}
 CREATININE_CENTROIDS_LAB = {k: _rgb_to_lab_triplet(v) for k, v in CREATININE_CENTROIDS.items()}
+MICROALBUMIN_LOW_SHADE_REFS_LAB = {
+    k: _rgb_to_lab_triplet(v["rgb"])
+    for k, v in MICROALBUMIN_LOW_SHADE_REFS.items()
+}
+MICROALBUMIN_AQUA_CONFIRM_REFS_LAB = {
+    k: _rgb_to_lab_triplet(v["rgb"])
+    for k, v in MICROALBUMIN_AQUA_CONFIRM_REFS.items()
+}
+
+
+def _deltae_pixels_to_lab_ref(lab_pixels, lab_ref):
+    """
+    lab_pixels: shape (N, 3)
+    lab_ref: shape (3,)
+    Return: shape (N,) ΔE distance array.
+    Prefer CIEDE2000 if available. Fall back to weighted CIE76 using _lab_distance wL logic.
+    """
+    if lab_pixels.size == 0:
+        return np.array([], dtype=np.float64)
+    px = np.asarray(lab_pixels, dtype=np.float64).reshape(-1, 3)
+    ref = np.asarray(lab_ref, dtype=np.float64).reshape(1, 3)
+    if HAVE_DE00:
+        px_reshaped = px.reshape(-1, 1, 3)
+        ref_reshaped = np.tile(ref.reshape(1, 1, 3), (px.shape[0], 1, 1))
+        return _deltaE2000(px_reshaped, ref_reshaped).reshape(-1).astype(np.float64)
+    dL = (px[:, 0] - ref[0, 0]) * math.sqrt(0.5)
+    da = px[:, 1] - ref[0, 1]
+    db = px[:, 2] - ref[0, 2]
+    return np.sqrt(dL * dL + da * da + db * db)
+
+
+def microalbumin_shade_sanity_check(
+    img_rgb_uint8,
+    pod_mask_bool,
+    current_albumin_value,
+    current_albumin_label=None,
+):
+    """
+    Conservative post-hoc visual sanity check for the microalbumin pod.
+
+    This does not replace regression or centroid classification. It exists to prevent
+    false upward microalbumin labelling when the pod is visually in the 10/30 mg/L
+    low-shade region and lacks 80/150 mg/L aqua-blue evidence.
+    """
+    original_value = current_albumin_value
+    pod_eroded = eroded_mask(pod_mask_bool)
+    total_pixels = int(pod_eroded.sum())
+
+    if total_pixels < MICRO_SHADE_MIN_PIXELS:
+        return {
+            "guard_name": "microalbumin_shade_sanity_check",
+            "guard_applied": False,
+            "action": "unchanged_insufficient_mask",
+            "original_albumin_value": original_value,
+            "corrected_albumin_value": original_value,
+            "guard_reason": "Insufficient microalbumin pod pixels for shade sanity check.",
+        }
+
+    rgb_pixels = img_rgb_uint8[pod_eroded]
+    lab_pixels = rgb2lab(rgb_pixels.reshape(-1, 1, 3)).reshape(-1, 3).astype(np.float64)
+
+    de_10 = _deltae_pixels_to_lab_ref(lab_pixels, MICROALBUMIN_LOW_SHADE_REFS_LAB[10])
+    de_30 = _deltae_pixels_to_lab_ref(lab_pixels, MICROALBUMIN_LOW_SHADE_REFS_LAB[30])
+    de_80 = _deltae_pixels_to_lab_ref(lab_pixels, MICROALBUMIN_AQUA_CONFIRM_REFS_LAB[80])
+    de_150 = _deltae_pixels_to_lab_ref(lab_pixels, MICROALBUMIN_AQUA_CONFIRM_REFS_LAB[150])
+
+    low_pixel_de = np.minimum(de_10, de_30)
+    aqua_pixel_de = np.minimum(de_80, de_150)
+
+    median_de_10 = float(np.median(de_10))
+    median_de_30 = float(np.median(de_30))
+    median_de_80 = float(np.median(de_80))
+    median_de_150 = float(np.median(de_150))
+    median_low_de = min(median_de_10, median_de_30)
+    median_aqua_de = min(median_de_80, median_de_150)
+
+    low_candidate_class_mg_l = 10 if median_de_10 <= median_de_30 else 30
+    aqua_candidate_class_mg_l = 80 if median_de_80 <= median_de_150 else 150
+    low_margin = abs(median_de_10 - median_de_30)
+    aqua_margin = abs(median_de_80 - median_de_150)
+
+    low_evidence_mask = (
+        (low_pixel_de <= MICRO_SHADE_PIXEL_DE_ACCEPT) &
+        (low_pixel_de + MICRO_SHADE_ADVANTAGE_MARGIN < aqua_pixel_de)
+    )
+    aqua_evidence_mask = (
+        (aqua_pixel_de <= MICRO_SHADE_PIXEL_DE_ACCEPT) &
+        (aqua_pixel_de + MICRO_SHADE_ADVANTAGE_MARGIN < low_pixel_de)
+    )
+    low_pixel_fraction = float(low_evidence_mask.sum() / max(total_pixels, 1))
+    aqua_pixel_fraction = float(aqua_evidence_mask.sum() / max(total_pixels, 1))
+
+    current_value_float = None if current_albumin_value is None else float(current_albumin_value)
+    current_is_high = current_value_float is not None and current_value_float > 30.0
+    high_value_confirmed_by_aqua = bool(
+        current_is_high and (
+            aqua_pixel_fraction >= MICRO_AQUA_SHADE_FRACTION_MIN or
+            (
+                median_aqua_de <= MICRO_SHADE_MEDIAN_LOW_DE_ACCEPT and
+                median_aqua_de + MICRO_SHADE_ADVANTAGE_MARGIN < median_low_de
+            )
+        )
+    )
+
+    guard_applied = False
+    action = "unchanged_high_ambiguous_not_low_enough"
+    guard_reason = (
+        "Higher albumin value lacks strong aqua-blue confirmation, but the pod also lacks "
+        "sufficient 10/30 mg/L low-shade evidence for safe downward correction."
+    )
+    corrected_albumin_value = current_value_float if current_value_float is not None else current_albumin_value
+
+    # Conservative safety guard: never assign high values from these references.
+    # The 80/150 aqua references are used only to confirm or veto an already-high label.
+    # This only vetoes likely false upward labels and does not diagnose kidney disease.
+    # Clinical interpretation still depends on ACR, not albumin colour alone.
+    if current_is_high:
+        if (
+            (not high_value_confirmed_by_aqua) and
+            (median_low_de <= MICRO_SHADE_MEDIAN_LOW_DE_ACCEPT) and
+            (low_pixel_fraction >= MICRO_LOW_SHADE_FRACTION_MIN) and
+            (aqua_pixel_fraction < MICRO_AQUA_SHADE_FRACTION_MIN)
+        ):
+            corrected_albumin_value = float(low_candidate_class_mg_l)
+            guard_applied = True
+            action = "override_high_to_low_nearest_shade"
+            guard_reason = (
+                "Higher albumin label was not supported by 80/150 mg/L aqua-blue evidence; "
+                "pod is nearest to the 10/30 mg/L low-albumin shade group."
+            )
+        elif high_value_confirmed_by_aqua:
+            action = "unchanged_high_confirmed_by_aqua"
+            guard_reason = "Higher albumin value has aqua-blue visual evidence; low-end override blocked."
+    else:
+        strong_low_evidence = (
+            median_low_de <= MICRO_SHADE_MEDIAN_LOW_DE_ACCEPT and
+            low_pixel_fraction >= MICRO_LOW_SHADE_FRACTION_MIN
+        )
+        if strong_low_evidence:
+            corrected_albumin_value = float(low_candidate_class_mg_l)
+            action = "confirmed_low_nearest_shade"
+            guard_reason = "Existing albumin value is already low; nearest 10/30 mg/L shade confirmed."
+        else:
+            action = "unchanged_low_value_not_visually_confirmed"
+            guard_reason = "Existing albumin value is low, but low-shade evidence was not strong enough for visual refinement."
+
+    if guard_applied:
+        confidence_bucket = "High" if (low_pixel_fraction >= 0.70 and aqua_pixel_fraction < 0.02) else "Moderate"
+    elif action == "confirmed_low_nearest_shade":
+        confidence_bucket = "Moderate"
+    elif high_value_confirmed_by_aqua:
+        confidence_bucket = "Informational"
+    else:
+        confidence_bucket = "Low"
+
+    if low_margin < 1.5 and corrected_albumin_value in (10, 10.0, 30, 30.0):
+        if confidence_bucket == "High":
+            confidence_bucket = "Moderate"
+        guard_reason += " The 10 and 30 mg/L reference shades are visually close; nearest shade selected by median ΔE."
+
+    if guard_applied:
+        logging.warning(
+            "Microalbumin shade guard corrected high albumin value %s to %s. "
+            "low_fraction=%.3f aqua_fraction=%.3f reason=%s",
+            original_value,
+            corrected_albumin_value,
+            low_pixel_fraction,
+            aqua_pixel_fraction,
+            guard_reason,
+        )
+
+    low_ref = MICROALBUMIN_LOW_SHADE_REFS[low_candidate_class_mg_l]
+    aqua_ref = MICROALBUMIN_AQUA_CONFIRM_REFS[aqua_candidate_class_mg_l]
+    return {
+        "guard_name": "microalbumin_shade_sanity_check",
+        "guard_applied": bool(guard_applied),
+        "action": action,
+        "original_albumin_value": original_value,
+        "original_albumin_label": current_albumin_label,
+        "corrected_albumin_value": corrected_albumin_value,
+        "low_candidate_class_mg_l": int(low_candidate_class_mg_l),
+        "low_candidate_rgb": tuple(int(x) for x in low_ref["rgb"]),
+        "low_candidate_hex": str(low_ref["hex"]),
+        "low_candidate_visual_name": str(low_ref["visual_name"]),
+        "aqua_candidate_class_mg_l": int(aqua_candidate_class_mg_l),
+        "aqua_candidate_rgb": tuple(int(x) for x in aqua_ref["rgb"]),
+        "aqua_candidate_hex": str(aqua_ref["hex"]),
+        "aqua_candidate_visual_name": str(aqua_ref["visual_name"]),
+        "median_de_10": float(median_de_10),
+        "median_de_30": float(median_de_30),
+        "median_de_80": float(median_de_80),
+        "median_de_150": float(median_de_150),
+        "median_low_de": float(median_low_de),
+        "median_aqua_de": float(median_aqua_de),
+        "low_margin": float(low_margin),
+        "aqua_margin": float(aqua_margin),
+        "low_pixel_fraction": float(low_pixel_fraction),
+        "aqua_pixel_fraction": float(aqua_pixel_fraction),
+        "high_value_confirmed_by_aqua": bool(high_value_confirmed_by_aqua),
+        "confidence_bucket": confidence_bucket,
+        "guard_reason": guard_reason,
+    }
 
 # ───────────────────────────────
 # White balance & robust color extraction
@@ -552,22 +787,25 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
     axs[1].imshow(patch1, interpolation='nearest'); axs[1].axis('off'); axs[1].set_title(f"Creatinine\n{disp1} mg/dL\nRGB{tuple(p1_mean_display)}{p1_quality_suffix}")
 
     patch2 = np.ones((50, 50, 3), np.uint8) * p2_mean_display.reshape(1, 1, 3)
-    lab_obs = _rgb_to_lab_triplet(tuple(p2_mean_display))
-    color_lbl, color_de = nearest_micro_centroid_lab(lab_obs)
-    reg_lbl = find_closest_reference_value_label(calibrated_p2, 'pod2')
-
-    if reg_lbl.isdigit() and int(reg_lbl) in MICROALBUMIN_CENTROIDS_LAB:
-        lab_reg_cent = MICROALBUMIN_CENTROIDS_LAB[int(reg_lbl)]
-        reg_de = _lab_distance(lab_obs, lab_reg_cent)
-    else:
-        reg_de = float('inf')
-
-    disp2 = color_lbl if (color_de <= MICRO_DELTAE_ACCEPT) and ((reg_de - color_de) > MICRO_DELTAE_MARGIN) else reg_lbl
+    disp2 = find_closest_reference_value_label(calibrated_p2, 'pod2')
     p2_quality_suffix = ""
+    p2_guard_suffix = ""
     if pod_quality and pod_quality.get('microalbumin'):
         q = pod_quality['microalbumin']
         p2_quality_suffix = f"\nConf {q.get('confidence_pct', 'NA')}% ({q.get('confidence_bucket', 'NA')})"
-    axs[2].imshow(patch2, interpolation='nearest'); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2} mg/L\nRGB{tuple(p2_mean_display)}{p2_quality_suffix}")
+        shade_guard = q.get('shade_sanity_check')
+        if isinstance(shade_guard, dict):
+            action = shade_guard.get('action', 'unknown')
+            low_pct = 100.0 * float(shade_guard.get('low_pixel_fraction', 0.0))
+            aqua_pct = 100.0 * float(shade_guard.get('aqua_pixel_fraction', 0.0))
+            low_visual = shade_guard.get('low_candidate_visual_name', 'n/a')
+            p2_guard_suffix = (
+                f"\nShade guard: {action}"
+                f"\nLow evidence: {low_pct:.1f}%"
+                f"\nAqua evidence: {aqua_pct:.1f}%"
+                f"\nLow visual: {low_visual}"
+            )
+    axs[2].imshow(patch2, interpolation='nearest'); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2} mg/L\nRGB{tuple(p2_mean_display)}{p2_quality_suffix}{p2_guard_suffix}")
 
     if uacr_display:
         color = 'darkgreen' if 'A1' in uacr_display else '#D98E04' if 'A2' in uacr_display else 'darkred'
@@ -672,11 +910,20 @@ def process_image_and_get_pods(image_path, model, device):
 
     c1_snapped, c1_low_end_label = apply_low_end_snap('creatinine', tuple(p1_mean_ui), c1_pre_snap)
     c2_snapped, c2_low_end_label = apply_low_end_snap('microalbumin', tuple(p2_mean_ui), c2_pre_snap)
+    albumin_shade_guard = microalbumin_shade_sanity_check(
+        wb_np,
+        pod2_mask,
+        c2_snapped,
+        current_albumin_label=c2_low_end_label,
+    )
+    c2_final = albumin_shade_guard.get("corrected_albumin_value", c2_snapped)
+    if c2_final is None:
+        c2_final = c2_snapped
 
     # Preserve legacy behavior trace (continuous calibrated values) and corrected
     # behavior trace (snapped/displayed values) to avoid disruption in existing flow.
     uacr_legacy_value, _, _, _ = calculate_uacr_and_category(c2, c1)
-    uacr_value, uacr_stage, uacr_range, uacr_display = calculate_uacr_and_category(c2_snapped, c1_snapped)
+    uacr_value, uacr_stage, uacr_range, uacr_display = calculate_uacr_and_category(c2_final, c1_snapped)
     uacr_confidence = round(min(pod1_conf['confidence'], pod2_conf['confidence']) * 100.0, 1)
     uacr_conf_bucket = 'High' if uacr_confidence >= 85 else 'Moderate' if uacr_confidence >= 65 else 'Low'
     uacr_delta = None if (uacr_legacy_value is None or uacr_value is None) else round(uacr_legacy_value - uacr_value, 2)
@@ -705,12 +952,15 @@ def process_image_and_get_pods(image_path, model, device):
         p1_mean_ui,
         p2_mean_ui,
         c1_snapped,
-        c2_snapped,
+        c2_final,
         uacr_display,
         fpath,
         pod_quality={
             'creatinine': pod1_conf,
-            'microalbumin': pod2_conf,
+            'microalbumin': {
+                **pod2_conf,
+                'shade_sanity_check': albumin_shade_guard,
+            },
         },
         uacr_confidence=uacr_confidence,
     )
@@ -727,7 +977,12 @@ def process_image_and_get_pods(image_path, model, device):
         'uacr_corrected_value': uacr_value,
         'uacr_delta_legacy_minus_corrected': uacr_delta,
         'uacr_legacy_trace': build_uacr_trace(c2, c1, uacr_legacy_value, 'legacy_calibrated_continuous'),
-        'uacr_corrected_trace': build_uacr_trace(c2_snapped, c1_snapped, uacr_value, 'corrected_snapped_displayed'),
+        'uacr_corrected_trace': build_uacr_trace(
+            c2_final,
+            c1_snapped,
+            uacr_value,
+            'corrected_snapped_displayed_with_microalbumin_shade_guard'
+        ),
         # Quality and confidence payload for on-screen evidence display.
         'pod_quality': {
             'creatinine': {
@@ -751,8 +1006,10 @@ def process_image_and_get_pods(image_path, model, device):
                 'raw_regression_value': c2,
                 'raw_color_chart_value': c2_color,
                 'raw_color_chart_label': c2_color_label,
-                'final_display_value': c2_snapped,
+                'final_display_value_before_shade_guard': c2_snapped,
+                'final_display_value': c2_final,
                 'low_end_snap_label': c2_low_end_label,
+                'shade_sanity_check': albumin_shade_guard,
             },
         },
         'uacr_confidence_pct': uacr_confidence,
