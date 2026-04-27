@@ -134,6 +134,32 @@ class TestMicroalbuminShadeGuard(unittest.TestCase):
         self.assertFalse(out["guard_applied"])
         self.assertEqual(out["action"], "unchanged_high_confirmed_by_aqua")
 
+    def test_j_periwinkle_blue_cast_1000_is_clipped_to_mid_range(self):
+        img, mask = make_uniform_pod((152, 162, 209))
+        out = microalbumin_shade_sanity_check(img, mask, 1000)
+        self.assertTrue(out["guard_applied"])
+        self.assertEqual(out["action"], "override_high_to_mid_cool_blue_cast")
+        self.assertTrue(out["likely_cool_blue_cast"])
+        self.assertLessEqual(out["corrected_albumin_value"], 600.0)
+        self.assertGreaterEqual(out["median_blue_minus_green"], 24.0)
+
+    def test_k_lavender_blue_cast_1000_is_clipped_to_mid_range(self):
+        img, mask = make_uniform_pod((152, 168, 247))
+        out = microalbumin_shade_sanity_check(img, mask, 1000)
+        self.assertTrue(out["guard_applied"])
+        self.assertEqual(out["action"], "override_high_to_mid_cool_blue_cast")
+        self.assertTrue(out["likely_cool_blue_cast"])
+        self.assertLessEqual(out["corrected_albumin_value"], 600.0)
+        self.assertLess(out["aqua_pixel_fraction"], 0.05)
+
+    def test_l_blue_cast_800_is_clipped_when_not_aqua(self):
+        img, mask = make_uniform_pod((138, 163, 228))
+        out = microalbumin_shade_sanity_check(img, mask, 800)
+        self.assertTrue(out["guard_applied"])
+        self.assertEqual(out["action"], "override_high_to_mid_cool_blue_cast")
+        self.assertTrue(out["likely_cool_blue_cast"])
+        self.assertLessEqual(out["corrected_albumin_value"], 600.0)
+
 
 if __name__ == "__main__":
     unittest.main()

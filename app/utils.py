@@ -47,6 +47,10 @@ MICRO_LOW_SHADE_FRACTION_MIN = 0.50
 MICRO_AQUA_SHADE_FRACTION_MIN = 0.05
 MICRO_AQUA_SHADE_STRONG_FRACTION = 0.12
 MICRO_SHADE_MIN_PIXELS = 50
+MICRO_COOL_BLUE_PIXEL_B_MINUS_G_MIN = 20
+MICRO_COOL_BLUE_PIXEL_FRACTION_MIN = 0.55
+MICRO_COOL_BLUE_MEDIAN_B_MINUS_G_MIN = 24
+MICRO_COOL_BLUE_MEDIAN_DE_ACCEPT = 10.0
 
 # Post-extraction quality-control thresholds
 QUALITY_THRESHOLDS = {
@@ -161,6 +165,19 @@ MICROALBUMIN_AQUA_CONFIRM_REFS = {
     },
 }
 
+MICROALBUMIN_COOL_BLUE_HIGH_REFS = {
+    800: {
+        "rgb": (138, 163, 228),
+        "hex": "#8AA3E4",
+        "visual_name": "periwinkle blue cast (likely cool-lit high strip)",
+    },
+    1000: {
+        "rgb": (152, 162, 209),
+        "hex": "#98A2D1",
+        "visual_name": "lavender blue cast (likely cool-lit high strip)",
+    },
+}
+
 # Creatinine (pod1) → added bin 25
 CREATININE_CENTROIDS = {
     "10 (0.1)":  (190, 177, 52), # Updated centroid from new Label 10 dataset
@@ -199,6 +216,10 @@ MICROALBUMIN_LOW_SHADE_REFS_LAB = {
 MICROALBUMIN_AQUA_CONFIRM_REFS_LAB = {
     k: _rgb_to_lab_triplet(v["rgb"])
     for k, v in MICROALBUMIN_AQUA_CONFIRM_REFS.items()
+}
+MICROALBUMIN_COOL_BLUE_HIGH_REFS_LAB = {
+    k: _rgb_to_lab_triplet(v["rgb"])
+    for k, v in MICROALBUMIN_COOL_BLUE_HIGH_REFS.items()
 }
 
 
@@ -251,7 +272,13 @@ def microalbumin_shade_sanity_check(
         }
 
     rgb_pixels = img_rgb_uint8[pod_eroded]
+    median_rgb = np.median(rgb_pixels, axis=0).astype(np.float64)
+    median_blue_minus_green = float(median_rgb[2] - median_rgb[1])
+    cool_blue_pixel_fraction = float(
+        np.mean((rgb_pixels[:, 2].astype(np.float64) - rgb_pixels[:, 1].astype(np.float64)) >= MICRO_COOL_BLUE_PIXEL_B_MINUS_G_MIN)
+    )
     lab_pixels = rgb2lab(rgb_pixels.reshape(-1, 1, 3)).reshape(-1, 3).astype(np.float64)
+    median_lab = rgb2lab(np.uint8([[np.clip(np.round(median_rgb), 0, 255).astype(np.uint8)]])).reshape(3,).astype(np.float64)
 
     de_10 = _deltae_pixels_to_lab_ref(lab_pixels, MICROALBUMIN_LOW_SHADE_REFS_LAB[10])
     de_30 = _deltae_pixels_to_lab_ref(lab_pixels, MICROALBUMIN_LOW_SHADE_REFS_LAB[30])
@@ -267,6 +294,12 @@ def microalbumin_shade_sanity_check(
     median_de_150 = float(np.median(de_150))
     median_low_de = min(median_de_10, median_de_30)
     median_aqua_de = min(median_de_80, median_de_150)
+    cool_blue_de_by_label = {
+        int(lbl): _lab_distance(median_lab, lab_ref)
+        for lbl, lab_ref in MICROALBUMIN_COOL_BLUE_HIGH_REFS_LAB.items()
+    }
+    cool_blue_candidate_class_mg_l = min(cool_blue_de_by_label, key=cool_blue_de_by_label.get)
+    median_cool_blue_de = float(cool_blue_de_by_label[cool_blue_candidate_class_mg_l])
 
     low_candidate_class_mg_l = 10 if median_de_10 <= median_de_30 else 30
     aqua_candidate_class_mg_l = 80 if median_de_80 <= median_de_150 else 150
@@ -294,6 +327,11 @@ def microalbumin_shade_sanity_check(
                 median_aqua_de + MICRO_SHADE_ADVANTAGE_MARGIN < median_low_de
             )
         )
+    )
+    likely_cool_blue_cast = bool(
+        (median_blue_minus_green >= MICRO_COOL_BLUE_MEDIAN_B_MINUS_G_MIN) and
+        (cool_blue_pixel_fraction >= MICRO_COOL_BLUE_PIXEL_FRACTION_MIN) and
+        (median_cool_blue_de <= MICRO_COOL_BLUE_MEDIAN_DE_ACCEPT)
     )
 
     guard_applied = False
@@ -325,6 +363,19 @@ def microalbumin_shade_sanity_check(
         elif high_value_confirmed_by_aqua:
             action = "unchanged_high_confirmed_by_aqua"
             guard_reason = "Higher albumin value has aqua-blue visual evidence; low-end override blocked."
+        elif likely_cool_blue_cast:
+            allowed_mid_labels = [80, 150, 250, 400, 600]
+            mid_candidate_class_mg_l = min(
+                allowed_mid_labels,
+                key=lambda label: _lab_distance(median_lab, MICROALBUMIN_CENTROIDS_LAB[label])
+            )
+            corrected_albumin_value = float(mid_candidate_class_mg_l)
+            guard_applied = True
+            action = "override_high_to_mid_cool_blue_cast"
+            guard_reason = (
+                "High albumin label lacked aqua confirmation and pod appears periwinkle/lavender blue "
+                "(cool-light cast). Value was conservatively clipped to nearest <=600 mg/L shade."
+            )
     else:
         strong_low_evidence = (
             median_low_de <= MICRO_SHADE_MEDIAN_LOW_DE_ACCEPT and
@@ -365,6 +416,7 @@ def microalbumin_shade_sanity_check(
 
     low_ref = MICROALBUMIN_LOW_SHADE_REFS[low_candidate_class_mg_l]
     aqua_ref = MICROALBUMIN_AQUA_CONFIRM_REFS[aqua_candidate_class_mg_l]
+    cool_blue_ref = MICROALBUMIN_COOL_BLUE_HIGH_REFS[cool_blue_candidate_class_mg_l]
     return {
         "guard_name": "microalbumin_shade_sanity_check",
         "guard_applied": bool(guard_applied),
@@ -380,17 +432,25 @@ def microalbumin_shade_sanity_check(
         "aqua_candidate_rgb": tuple(int(x) for x in aqua_ref["rgb"]),
         "aqua_candidate_hex": str(aqua_ref["hex"]),
         "aqua_candidate_visual_name": str(aqua_ref["visual_name"]),
+        "cool_blue_candidate_class_mg_l": int(cool_blue_candidate_class_mg_l),
+        "cool_blue_candidate_rgb": tuple(int(x) for x in cool_blue_ref["rgb"]),
+        "cool_blue_candidate_hex": str(cool_blue_ref["hex"]),
+        "cool_blue_candidate_visual_name": str(cool_blue_ref["visual_name"]),
         "median_de_10": float(median_de_10),
         "median_de_30": float(median_de_30),
         "median_de_80": float(median_de_80),
         "median_de_150": float(median_de_150),
         "median_low_de": float(median_low_de),
         "median_aqua_de": float(median_aqua_de),
+        "median_cool_blue_de": float(median_cool_blue_de),
+        "median_blue_minus_green": float(median_blue_minus_green),
+        "cool_blue_pixel_fraction": float(cool_blue_pixel_fraction),
         "low_margin": float(low_margin),
         "aqua_margin": float(aqua_margin),
         "low_pixel_fraction": float(low_pixel_fraction),
         "aqua_pixel_fraction": float(aqua_pixel_fraction),
         "high_value_confirmed_by_aqua": bool(high_value_confirmed_by_aqua),
+        "likely_cool_blue_cast": bool(likely_cool_blue_cast),
         "confidence_bucket": confidence_bucket,
         "guard_reason": guard_reason,
     }
