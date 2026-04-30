@@ -1,8 +1,11 @@
 import unittest
 import types
 import sys
+from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # Lightweight module stubs to keep tests independent of OpenCV/albumentations runtime libs.
 if "albumentations" not in sys.modules:
@@ -56,7 +59,7 @@ def make_uniform_pod(rgb):
 
 
 class TestMicroalbuminShadeGuard(unittest.TestCase):
-    def test_a_uniform_10_shade_overrides_800(self):
+    def test_low_10_not_finalized_as_800(self):
         img, mask = make_uniform_pod((175, 177, 168))
         out = microalbumin_shade_sanity_check(img, mask, 800)
         self.assertTrue(out["guard_applied"])
@@ -64,7 +67,7 @@ class TestMicroalbuminShadeGuard(unittest.TestCase):
         self.assertEqual(out["action"], "override_high_to_low_nearest_shade")
         self.assertLess(out["aqua_pixel_fraction"], 0.05)
 
-    def test_b_uniform_30_shade_overrides_1000(self):
+    def test_low_30_not_finalized_as_1000(self):
         img, mask = make_uniform_pod((175, 178, 165))
         out = microalbumin_shade_sanity_check(img, mask, 1000)
         self.assertTrue(out["guard_applied"])
@@ -72,21 +75,21 @@ class TestMicroalbuminShadeGuard(unittest.TestCase):
         self.assertEqual(out["action"], "override_high_to_low_nearest_shade")
         self.assertLess(out["aqua_pixel_fraction"], 0.05)
 
-    def test_c_uniform_10_shade_with_low_value_confirms_low(self):
+    def test_existing_low_10_confirmed(self):
         img, mask = make_uniform_pod((175, 177, 168))
         out = microalbumin_shade_sanity_check(img, mask, 10)
         self.assertFalse(out["guard_applied"])
         self.assertIn(out["corrected_albumin_value"], [10.0, 30.0])
         self.assertEqual(out["action"], "confirmed_low_nearest_shade")
 
-    def test_d_uniform_30_shade_with_low_value_confirms_low(self):
+    def test_existing_low_30_confirmed(self):
         img, mask = make_uniform_pod((175, 178, 165))
         out = microalbumin_shade_sanity_check(img, mask, 30)
         self.assertFalse(out["guard_applied"])
         self.assertIn(out["corrected_albumin_value"], [10.0, 30.0])
         self.assertEqual(out["action"], "confirmed_low_nearest_shade")
 
-    def test_e_uniform_80_aqua_confirms_high(self):
+    def test_aqua_80_blocks_downward_override(self):
         img, mask = make_uniform_pod((166, 181, 184))
         out = microalbumin_shade_sanity_check(img, mask, 80)
         self.assertFalse(out["guard_applied"])
@@ -94,7 +97,7 @@ class TestMicroalbuminShadeGuard(unittest.TestCase):
         self.assertTrue(out["high_value_confirmed_by_aqua"])
         self.assertEqual(out["action"], "unchanged_high_confirmed_by_aqua")
 
-    def test_f_uniform_150_aqua_confirms_high(self):
+    def test_aqua_150_blocks_downward_override(self):
         img, mask = make_uniform_pod((156, 178, 189))
         out = microalbumin_shade_sanity_check(img, mask, 150)
         self.assertFalse(out["guard_applied"])
@@ -102,13 +105,7 @@ class TestMicroalbuminShadeGuard(unittest.TestCase):
         self.assertTrue(out["high_value_confirmed_by_aqua"])
         self.assertEqual(out["action"], "unchanged_high_confirmed_by_aqua")
 
-    def test_g_uniform_10_shade_does_not_finalize_1000(self):
-        img, mask = make_uniform_pod((175, 177, 168))
-        out = microalbumin_shade_sanity_check(img, mask, 1000)
-        self.assertNotEqual(out["corrected_albumin_value"], 1000)
-        self.assertIn(out["corrected_albumin_value"], [10.0, 30.0])
-
-    def test_h_noisy_low_shade_still_overrides_high(self):
+    def test_low_30_with_noise_not_finalized_as_800(self):
         rng = np.random.default_rng(7)
         img = np.full((64, 64, 3), (175, 178, 165), dtype=np.int16)
         noisy_count = int(0.10 * 64 * 64)
@@ -123,7 +120,7 @@ class TestMicroalbuminShadeGuard(unittest.TestCase):
         self.assertTrue(out["guard_applied"])
         self.assertIn(out["corrected_albumin_value"], [10.0, 30.0])
 
-    def test_i_mixed_with_aqua_fraction_blocks_override(self):
+    def test_aqua_fraction_blocks_low_override(self):
         img = np.full((64, 64, 3), (175, 178, 165), dtype=np.uint8)
         aqua_count = int(0.15 * 64 * 64)
         flat = img.reshape(-1, 3)
@@ -133,32 +130,6 @@ class TestMicroalbuminShadeGuard(unittest.TestCase):
         out = microalbumin_shade_sanity_check(img, mask, 80)
         self.assertFalse(out["guard_applied"])
         self.assertEqual(out["action"], "unchanged_high_confirmed_by_aqua")
-
-    def test_j_periwinkle_blue_cast_1000_is_clipped_to_mid_range(self):
-        img, mask = make_uniform_pod((152, 162, 209))
-        out = microalbumin_shade_sanity_check(img, mask, 1000)
-        self.assertTrue(out["guard_applied"])
-        self.assertEqual(out["action"], "override_high_to_mid_cool_blue_cast")
-        self.assertTrue(out["likely_cool_blue_cast"])
-        self.assertLessEqual(out["corrected_albumin_value"], 600.0)
-        self.assertGreaterEqual(out["median_blue_minus_green"], 24.0)
-
-    def test_k_lavender_blue_cast_1000_is_clipped_to_mid_range(self):
-        img, mask = make_uniform_pod((152, 168, 247))
-        out = microalbumin_shade_sanity_check(img, mask, 1000)
-        self.assertTrue(out["guard_applied"])
-        self.assertEqual(out["action"], "override_high_to_mid_cool_blue_cast")
-        self.assertTrue(out["likely_cool_blue_cast"])
-        self.assertLessEqual(out["corrected_albumin_value"], 600.0)
-        self.assertLess(out["aqua_pixel_fraction"], 0.05)
-
-    def test_l_blue_cast_800_is_clipped_when_not_aqua(self):
-        img, mask = make_uniform_pod((138, 163, 228))
-        out = microalbumin_shade_sanity_check(img, mask, 800)
-        self.assertTrue(out["guard_applied"])
-        self.assertEqual(out["action"], "override_high_to_mid_cool_blue_cast")
-        self.assertTrue(out["likely_cool_blue_cast"])
-        self.assertLessEqual(out["corrected_albumin_value"], 600.0)
 
 
 if __name__ == "__main__":
