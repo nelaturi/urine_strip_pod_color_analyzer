@@ -393,6 +393,175 @@ def microalbumin_shade_sanity_check(
         logging.warning('Microalbumin shade guard corrected %s to %s. action=%s low_fraction=%.3f aqua_fraction=%.3f reason=%s', current_albumin_value, base['corrected_value'], base['action'], base['low_pixel_fraction'], base['aqua_pixel_fraction'], base['guard_reason'])
     return _build_response(**base)
 
+def derive_microalbumin_guarded_uacr_scenario(
+    shade_guard: dict,
+    creatinine_mg_dl,
+    original_albumin_value=None,
+    exact_albumin_value=None,
+):
+    """Derive conservative provisional UACR evidence from microalbumin shade guard."""
+    unavailable = {
+        "provisional_available": False,
+        "provisional_guard_scenario": "no_safe_a1_a2_mapping",
+        "provisional_reason": "Insufficient shade evidence for provisional A1/A2 mapping.",
+        "non_a3_supported": False,
+    }
+    if not shade_guard or creatinine_mg_dl is None:
+        return unavailable
+    try:
+        cr = float(creatinine_mg_dl)
+    except Exception:
+        return unavailable
+    if cr <= 0:
+        return unavailable
+
+    action = str(shade_guard.get("action", ""))
+    weak_aqua = bool(shade_guard.get("weak_aqua_present", False))
+    strong_aqua = bool(shade_guard.get("strong_aqua_confirmed", False))
+    overbright = bool(shade_guard.get("overbright_not_chart_like", False))
+    low_confirmed = bool(shade_guard.get("low_shade_confirmed", False))
+    nearest_low = shade_guard.get("low_candidate_class_mg_l")
+    low_visual = shade_guard.get("low_candidate_visual_name")
+    median_L = shade_guard.get("median_L")
+    low_fraction = shade_guard.get("low_pixel_fraction")
+    aqua_fraction = shade_guard.get("aqua_pixel_fraction")
+
+    albumin_range = None
+    scenario = None
+    reason = None
+    report_mode = None
+
+    if low_confirmed and nearest_low in (10, 30):
+        albumin_range = (float(nearest_low), float(nearest_low))
+        scenario = "confirmed_low_exact"
+        report_mode = "exact_low_confirmed"
+        reason = "Low microalbumin shade was confirmed by pixel evidence."
+    elif overbright and weak_aqua and not strong_aqua:
+        albumin_range = (30.0, 80.0)
+        scenario = "overbright_weak_aqua_non_a3"
+        report_mode = "provisional_range"
+        reason = "Overbright weak-aqua result: very-high microalbumin is not supported; use conservative low-to-moderate albumin range."
+    elif overbright and not weak_aqua and not strong_aqua:
+        albumin_range = (10.0, 30.0)
+        scenario = "overbright_low_comparator_non_a3"
+        report_mode = "provisional_range"
+        reason = "Overbright result without aqua support: use conservative low-end albumin range."
+    elif (not overbright) and weak_aqua and not strong_aqua:
+        albumin_range = (80.0, 150.0)
+        scenario = "chart_like_weak_aqua_moderate"
+        report_mode = "provisional_range"
+        reason = "Chart-like brightness with weak aqua evidence: exact high value is not confirmed; cap to moderate albumin range."
+    elif strong_aqua:
+        albumin_range = (80.0, 150.0)
+        scenario = "strong_aqua_moderate"
+        report_mode = "provisional_or_exact_moderate"
+        reason = "Strong aqua evidence supports moderate microalbumin range."
+    else:
+        return unavailable
+
+    uacr_low = 100.0 * albumin_range[0] / cr
+    uacr_high = 100.0 * albumin_range[1] / cr
+    uacr_low_display = round(uacr_low, 2)
+    uacr_high_display = round(uacr_high, 2)
+
+    if uacr_high < 30.0:
+        provisional_stage = "Provisional A1 / retest"
+        provisional_stage_code = "A1_provisional"
+    elif uacr_low >= 30.0 and uacr_high <= 300.0:
+        provisional_stage = "Provisional A2 / retest"
+        provisional_stage_code = "A2_provisional"
+    elif uacr_low < 30.0 and uacr_high <= 300.0:
+        provisional_stage = "Provisional A1/A2 boundary / retest"
+        provisional_stage_code = "A1_A2_boundary_provisional"
+    elif uacr_low <= 300.0 and uacr_high > 300.0:
+        provisional_stage = "A2/A3 boundary unconfirmed / retest"
+        provisional_stage_code = "A2_A3_boundary_unconfirmed"
+    else:
+        provisional_stage = "Unconfirmed / retest"
+        provisional_stage_code = "unconfirmed"
+
+    return {
+        "provisional_available": True,
+        "report_mode": report_mode,
+        "provisional_guard_scenario": scenario,
+        "provisional_reason": reason,
+        "provisional_albumin_range_mg_l": (float(albumin_range[0]), float(albumin_range[1])),
+        "provisional_albumin_display": f"{albumin_range[0]:.0f}\u2013{albumin_range[1]:.0f} mg/L",
+        "creatinine_used_mg_dl": float(cr),
+        "provisional_uacr_range_mg_g": (float(uacr_low_display), float(uacr_high_display)),
+        "provisional_uacr_display": f"{uacr_low_display:.2f}\u2013{uacr_high_display:.2f} mg/g",
+        "provisional_uacr_stage": provisional_stage,
+        "provisional_uacr_stage_code": provisional_stage_code,
+        "non_a3_supported": bool(uacr_high <= 300.0),
+        "source_guard_action": action,
+        "source_low_visual": None if low_visual is None else str(low_visual),
+        "source_median_L": None if median_L is None else float(median_L),
+        "source_low_pixel_fraction": None if low_fraction is None else float(low_fraction),
+        "source_aqua_pixel_fraction": None if aqua_fraction is None else float(aqua_fraction),
+        "source_weak_aqua": weak_aqua,
+        "source_strong_aqua": strong_aqua,
+        "source_overbright": overbright,
+        "source_low_confirmed": low_confirmed,
+    }
+
+def choose_microalbumin_report_display(exact_value, shade_guard, guarded_scenario):
+    """Decide what to display for microalbumin under shade-guarded reporting."""
+    action = str((shade_guard or {}).get("action", ""))
+    scenario_available = bool(isinstance(guarded_scenario, dict) and guarded_scenario.get("provisional_available"))
+    range_tuple = guarded_scenario.get("provisional_albumin_range_mg_l") if scenario_available else None
+    range_display = guarded_scenario.get("provisional_albumin_display") if scenario_available else None
+
+    def _provisional():
+        return {
+            "microalbumin_report_mode": "provisional_range",
+            "microalbumin_display_text": f"Provisional {range_display} / retest",
+            "microalbumin_exact_value_mg_l": None,
+            "microalbumin_range_mg_l": tuple(range_tuple) if range_tuple is not None else None,
+            "microalbumin_range_display": range_display,
+            "retest_recommended": True,
+        }
+
+    def _unconfirmed():
+        return {
+            "microalbumin_report_mode": "unconfirmed",
+            "microalbumin_display_text": "Unconfirmed / retest",
+            "microalbumin_exact_value_mg_l": None,
+            "microalbumin_range_mg_l": None,
+            "microalbumin_range_display": None,
+            "retest_recommended": True,
+        }
+
+    if action.startswith("unconfirmed_") or "ambiguous_not_confirmed" in action:
+        return _provisional() if scenario_available else _unconfirmed()
+    if exact_value is None:
+        return _provisional() if scenario_available else _unconfirmed()
+    if "confirmed_low_nearest_shade" in action or "override_very_high_to_low_nearest_shade" in action or "override_high_to_low_nearest_shade" in action or "override_mid_to_low_nearest_shade" in action:
+        return {
+            "microalbumin_report_mode": "exact",
+            "microalbumin_display_text": f"{float(exact_value):.0f} mg/L",
+            "microalbumin_exact_value_mg_l": float(exact_value),
+            "microalbumin_range_mg_l": None,
+            "microalbumin_range_display": None,
+            "retest_recommended": False,
+        }
+    if "confirmed_by_strong_aqua" in action and float(exact_value) in (80.0, 150.0):
+        return {
+            "microalbumin_report_mode": "exact",
+            "microalbumin_display_text": f"{float(exact_value):.0f} mg/L",
+            "microalbumin_exact_value_mg_l": float(exact_value),
+            "microalbumin_range_mg_l": None,
+            "microalbumin_range_display": None,
+            "retest_recommended": False,
+        }
+    return {
+        "microalbumin_report_mode": "exact",
+        "microalbumin_display_text": f"{float(exact_value):.0f} mg/L",
+        "microalbumin_exact_value_mg_l": float(exact_value),
+        "microalbumin_range_mg_l": None,
+        "microalbumin_range_display": None,
+        "retest_recommended": False,
+    }
+
 # ───────────────────────────────
 # White balance & robust color extraction
 # ───────────────────────────────
@@ -775,7 +944,8 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
                           uacr_display,
                           save_path,
                           pod_quality=None,
-                          uacr_confidence=None):
+                          uacr_confidence=None,
+                          uacr_report_payload=None):
     fig, axs = plt.subplots(1, 3, figsize=(9, 5))
     axs[0].imshow(raw_img, interpolation='nearest'); axs[0].axis('off'); axs[0].set_title('Original')
 
@@ -810,8 +980,14 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
                 if low_confirmed else
                 f"Nearest low comparator: {low_visual}"
             )
-            if str(action).startswith("unconfirmed_"):
+            report_mode = q.get("microalbumin_report_mode", "exact")
+            if report_mode == "provisional_range":
+                disp2 = q.get("microalbumin_display_text", "Provisional / retest")
+            elif report_mode == "unconfirmed":
                 disp2 = "Unconfirmed / retest"
+            else:
+                disp2 = q.get("microalbumin_display_text", disp2)
+            guard_scenario = (q.get("guarded_uacr_scenario") or {}).get("provisional_guard_scenario", "n/a")
             p2_guard_suffix = (
                 f"\nShade guard: {action}"
                 f"\nLow evidence: {low_pct:.1f}%"
@@ -821,13 +997,30 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
                 f"\nOverbright: {overbright}"
                 f"\nMedian L*: {median_l:.1f}"
                 f"\n{low_visual_line}"
+                f"\nGuard scenario: {guard_scenario}"
             )
-    axs[2].imshow(patch2, interpolation='nearest'); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2} mg/L\nRGB{tuple(p2_mean_display)}{p2_quality_suffix}{p2_guard_suffix}")
+    axs[2].imshow(patch2, interpolation='nearest'); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2}\nRGB{tuple(p2_mean_display)}{p2_quality_suffix}{p2_guard_suffix}")
 
     if uacr_display:
         color = 'darkgreen' if 'A1' in uacr_display else '#D98E04' if 'A2' in uacr_display else 'darkred'
         conf_text = f"\nEvidence confidence: {uacr_confidence}%" if uacr_confidence is not None else ""
-        fig.suptitle(f"UACR Result\n{uacr_display}{conf_text}", fontsize=11, fontweight='bold', color=color, y=0.97)
+        uacr_mode = (uacr_report_payload or {}).get("uacr_report_mode", "exact")
+        if uacr_mode == "provisional_range":
+            guarded_range = (uacr_report_payload or {}).get("uacr_reference_range", "Unavailable")
+            albumin_range = (uacr_report_payload or {}).get("uacr_guarded_albumin_range_mg_l")
+            albumin_range_txt = "Unavailable"
+            if albumin_range:
+                albumin_range_txt = f"{albumin_range[0]:.0f}\u2013{albumin_range[1]:.0f} mg/L"
+            suptitle = f"UACR Result\n{uacr_display}\nGuarded UACR range: {guarded_range}\nAlbumin guard range: {albumin_range_txt}\nExact albumin: not finalized{conf_text}"
+        elif uacr_mode == "unconfirmed":
+            suptitle = f"UACR Result\nUnconfirmed / retest{conf_text}"
+        else:
+            ref_range = (uacr_report_payload or {}).get("uacr_reference_range")
+            val = (uacr_report_payload or {}).get("uacr_value")
+            val_line = f"\nValue: {val:.2f} mg/G" if val is not None else ""
+            ref_line = f"\nReference Range: {ref_range}" if ref_range else ""
+            suptitle = f"UACR Result\n{uacr_display}{val_line}{ref_line}{conf_text}"
+        fig.suptitle(suptitle, fontsize=11, fontweight='bold', color=color, y=0.97)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.82])
     try:
@@ -935,13 +1128,41 @@ def process_image_and_get_pods(image_path, model, device):
         current_confidence=pod2_conf.get('confidence_pct'),
         allow_unconfirmed=True,
     )
-    c2_final = albumin_shade_guard.get("corrected_albumin_value", c2_snapped)
-    c2_final_display = None if c2_final is None else c2_final
+    albumin_guarded_scenario = derive_microalbumin_guarded_uacr_scenario(
+        shade_guard=albumin_shade_guard,
+        creatinine_mg_dl=c1_snapped,
+        original_albumin_value=c2_snapped,
+        exact_albumin_value=albumin_shade_guard.get("corrected_albumin_value"),
+    )
+    microalbumin_report_display = choose_microalbumin_report_display(
+        exact_value=albumin_shade_guard.get("corrected_albumin_value"),
+        shade_guard=albumin_shade_guard,
+        guarded_scenario=albumin_guarded_scenario,
+    )
+    c2_final_exact = albumin_shade_guard.get("corrected_albumin_value")
+    c2_report_mode = microalbumin_report_display["microalbumin_report_mode"]
+    c2_display_text = microalbumin_report_display["microalbumin_display_text"]
+    c2_range = microalbumin_report_display["microalbumin_range_mg_l"]
 
     # Preserve legacy behavior trace (continuous calibrated values) and corrected
     # behavior trace (snapped/displayed values) to avoid disruption in existing flow.
     uacr_legacy_value, _, _, _ = calculate_uacr_and_category(c2, c1)
-    uacr_value, uacr_stage, uacr_range, uacr_display = calculate_uacr_and_category(c2_final, c1_snapped)
+    guarded_uacr_range_mg_g = None
+    guarded_albumin_range_mg_l = None
+    if c2_report_mode == "exact":
+        uacr_value, uacr_stage, uacr_range, uacr_display = calculate_uacr_and_category(c2_final_exact, c1_snapped)
+    elif c2_report_mode == "provisional_range":
+        uacr_value = None
+        uacr_stage = albumin_guarded_scenario["provisional_uacr_stage"]
+        uacr_range = albumin_guarded_scenario["provisional_uacr_display"]
+        uacr_display = albumin_guarded_scenario["provisional_uacr_stage"]
+        guarded_uacr_range_mg_g = albumin_guarded_scenario["provisional_uacr_range_mg_g"]
+        guarded_albumin_range_mg_l = albumin_guarded_scenario["provisional_albumin_range_mg_l"]
+    else:
+        uacr_value = None
+        uacr_stage = "Unconfirmed / retest"
+        uacr_range = "Unavailable"
+        uacr_display = "Unconfirmed / retest"
     uacr_confidence = round(min(pod1_conf['confidence'], pod2_conf['confidence']) * 100.0, 1)
     uacr_conf_bucket = 'High' if uacr_confidence >= 85 else 'Moderate' if uacr_confidence >= 65 else 'Low'
     uacr_delta = None if (uacr_legacy_value is None or uacr_value is None) else round(uacr_legacy_value - uacr_value, 2)
@@ -970,7 +1191,7 @@ def process_image_and_get_pods(image_path, model, device):
         p1_mean_ui,
         p2_mean_ui,
         c1_snapped,
-        c2_final_display,
+        c2_final_exact,
         uacr_display,
         fpath,
         pod_quality={
@@ -978,28 +1199,58 @@ def process_image_and_get_pods(image_path, model, device):
             'microalbumin': {
                 **pod2_conf,
                 'shade_sanity_check': albumin_shade_guard,
+                'guarded_uacr_scenario': albumin_guarded_scenario,
+                'microalbumin_report_mode': c2_report_mode,
+                'microalbumin_display_text': c2_display_text,
             },
         },
         uacr_confidence=uacr_confidence,
+        uacr_report_payload={
+            "uacr_report_mode": c2_report_mode,
+            "uacr_value": uacr_value,
+            "uacr_reference_range": uacr_range,
+            "uacr_guarded_albumin_range_mg_l": guarded_albumin_range_mg_l,
+        },
     )
     
     return {
         'composite_img': fname,
         # Corrected value aligned to displayed snapped analyte values.
+        'uacr_report_mode': c2_report_mode,
         'uacr_value': uacr_value,
         'uacr_category': uacr_display,
         'uacr_stage': uacr_stage,
         'uacr_reference_range': uacr_range,
+        'uacr_display': uacr_display,
+        'uacr_guarded_range_mg_g': guarded_uacr_range_mg_g,
+        'uacr_guarded_albumin_range_mg_l': guarded_albumin_range_mg_l,
+        'uacr_retest_recommended': bool(microalbumin_report_display["retest_recommended"]),
+        'uacr_reporting_note': 'Provisional UACR ranges are triage-only and require retest when exact microalbumin is not finalized.',
         # Traceability fields to preserve legacy vs corrected outputs.
         'uacr_legacy_value': uacr_legacy_value,
         'uacr_corrected_value': uacr_value,
         'uacr_delta_legacy_minus_corrected': uacr_delta,
         'uacr_legacy_trace': build_uacr_trace(c2, c1, uacr_legacy_value, 'legacy_calibrated_continuous'),
-        'uacr_corrected_trace': build_uacr_trace(
-            c2_final,
-            c1_snapped,
-            uacr_value,
-            'corrected_snapped_displayed_with_microalbumin_shade_guard'
+        'uacr_corrected_trace': (
+            build_uacr_trace(c2_final_exact, c1_snapped, uacr_value, 'corrected_exact_with_microalbumin_shade_guard')
+            if c2_report_mode == "exact" else
+            {
+                "trace_type": "provisional_range_with_microalbumin_shade_guard",
+                "albumin_range_mg_l": guarded_albumin_range_mg_l,
+                "creatinine_mg_dl": c1_snapped,
+                "uacr_range_mg_g": guarded_uacr_range_mg_g,
+                "provisional_stage": uacr_stage,
+                "reason": albumin_guarded_scenario.get("provisional_reason"),
+                "source_guard_action": albumin_shade_guard.get("action"),
+            } if c2_report_mode == "provisional_range" else {
+                "trace_type": "unconfirmed_with_microalbumin_shade_guard",
+                "albumin_value": None,
+                "creatinine_mg_dl": c1_snapped,
+                "uacr_value": None,
+                "stage": "Unconfirmed / retest",
+                "reason": albumin_shade_guard.get("guard_reason"),
+                "source_guard_action": albumin_shade_guard.get("action"),
+            }
         ),
         # Quality and confidence payload for on-screen evidence display.
         'pod_quality': {
@@ -1025,9 +1276,15 @@ def process_image_and_get_pods(image_path, model, device):
                 'raw_color_chart_value': c2_color,
                 'raw_color_chart_label': c2_color_label,
                 'final_display_value_before_shade_guard': c2_snapped,
-                'final_display_value': c2_final_display,
+                'final_display_value': c2_final_exact,
                 'low_end_snap_label': c2_low_end_label,
                 'shade_sanity_check': albumin_shade_guard,
+                'guarded_uacr_scenario': albumin_guarded_scenario,
+                'microalbumin_report_mode': c2_report_mode,
+                'microalbumin_display_text': c2_display_text,
+                'microalbumin_report_range_mg_l': c2_range,
+                'retest_recommended': microalbumin_report_display["retest_recommended"],
+                'reporting_note': 'Exact microalbumin value is not finalized when guard evidence is unconfirmed or ambiguous; a provisional range is shown for A1/A2 triage only.',
             },
         },
         'uacr_confidence_pct': uacr_confidence,
