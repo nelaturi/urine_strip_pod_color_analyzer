@@ -90,6 +90,19 @@ MICRO_CHART_MEDIAN_DE_ACCEPT = MICRO_STRONG_AQUA_DE_MAX
 MICRO_MIN_CONFIDENCE_FOR_VERY_HIGH = MICRO_MIN_CONF_FOR_600
 MICRO_UNCONFIRMED_RETURNS_NONE = True
 
+# Experimental legacy-recovery fallback for V4-unconfirmed microalbumin only.
+ENABLE_MICROALBUMIN_UNCONFIRMED_LEGACY_RECOVERY = True
+MICRO_LEGACY_RECOVERY_MODE = "liberal"
+MICRO_LEGACY_RECOVERY_MIN_CHARTLIKE_DE = 28.0
+MICRO_LEGACY_RECOVERY_MIN_MARGIN = -999.0
+MICRO_LEGACY_RECOVERY_ACCEPT_OOD = True
+MICRO_LEGACY_RECOVERY_ACCEPT_LOW_CONFIDENCE = True
+MICRO_LEGACY_RECOVERY_CONFLICT_POLICY = "average_bin"
+MICRO_LEGACY_RECOVERY_UACR_POLICY = "higher_uacr"
+MICRO_LEGACY_RECOVERY_ALLOWED_BINS = [
+    3, 10, 30, 80, 150, 250, 400, 600, 800, 1000, 1400
+]
+
 # Post-extraction quality-control thresholds
 QUALITY_THRESHOLDS = {
     'sigma_l': 14.0,
@@ -1271,6 +1284,276 @@ def apply_low_end_snap(pod_type, rgb_obs, calibrated_value):
                 return snapped_value, label
     return calibrated_value, None
 
+
+def _safe_json_float(value, ndigits=4):
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(f):
+        return None
+    return round(f, ndigits)
+
+
+def _nearest_allowed_micro_legacy_bin(value):
+    f = _safe_json_float(value)
+    if f is None:
+        return None
+    return float(min(MICRO_LEGACY_RECOVERY_ALLOWED_BINS, key=lambda b: abs(float(b) - f)))
+
+
+def _empty_legacy_candidate(version, reason):
+    return {
+        "version": version,
+        "median_rgb": None,
+        "median_lab": None,
+        "continuous_albumin_value": None,
+        "mapped_albumin_bin": None,
+        "nearest_chart_bin": None,
+        "nearest_chart_de": None,
+        "low_end_snap_applied": False,
+        "reason": reason,
+    }
+
+
+def estimate_microalbumin_v2_style(raw_np, wb_np, pod_mask_bool, regression_model=None):
+    """
+    Approximate V2 behavior:
+    - Use gray-world white-balanced image path.
+    - Erode microalbumin pod mask.
+    - Extract median RGB from eroded WB pod pixels.
+    - Convert RGB to RGB/HSV/Lab feature vector.
+    - Run microalbumin regression model if available.
+    - Apply legacy low-end snapping when estimate <= 30 mg/L and nearest low centroid is close.
+    - Return both continuous estimate and snapped/bin estimate.
+    """
+    if wb_np is None:
+        if raw_np is None:
+            return _empty_legacy_candidate("v2_style", "missing_image")
+        wb_np = gray_world_white_balance(np.asarray(raw_np, dtype=np.uint8))
+    if pod_mask_bool is None:
+        return _empty_legacy_candidate("v2_style", "missing_pod_mask")
+
+    pod_eroded = eroded_mask(np.asarray(pod_mask_bool, dtype=bool))
+    if int(pod_eroded.sum()) < MICRO_SHADE_MIN_PIXELS:
+        return _empty_legacy_candidate("v2_style", "insufficient_mask_pixels")
+
+    median_rgb_arr = masked_median_rgb(np.asarray(wb_np, dtype=np.uint8), pod_eroded)
+    median_rgb = tuple(int(x) for x in median_rgb_arr.tolist())
+    median_lab_arr = _rgb_to_lab_triplet(median_rgb)
+    median_lab = tuple(_safe_json_float(x) for x in median_lab_arr.tolist())
+    nearest_chart_bin, nearest_chart_de = nearest_micro_centroid_lab(median_lab_arr)
+
+    continuous_value = None
+    reason = "nearest_chart_fallback"
+    if regression_model is not None:
+        try:
+            continuous_value = float(regression_model.predict([extract_features_from_rgb(median_rgb)])[0])
+            reason = "regression_model"
+        except Exception:
+            continuous_value = None
+            reason = "regression_failed_nearest_chart_fallback"
+
+    if continuous_value is None:
+        mapped_value = float(nearest_chart_bin) if nearest_chart_bin is not None else None
+    else:
+        snapped_value, low_end_label = apply_low_end_snap("microalbumin", median_rgb, continuous_value)
+        if low_end_label is not None:
+            mapped_value = float(snapped_value)
+        else:
+            mapped_value = _nearest_allowed_micro_legacy_bin(snapped_value)
+        reason = f"{reason}_low_end_snap" if low_end_label is not None else reason
+
+    mapped_bin = _nearest_allowed_micro_legacy_bin(mapped_value)
+    return {
+        "version": "v2_style",
+        "median_rgb": median_rgb,
+        "median_lab": median_lab,
+        "continuous_albumin_value": _safe_json_float(continuous_value),
+        "mapped_albumin_bin": mapped_bin,
+        "nearest_chart_bin": None if nearest_chart_bin is None else int(nearest_chart_bin),
+        "nearest_chart_de": _safe_json_float(nearest_chart_de),
+        "low_end_snap_applied": bool("low_end_snap" in reason),
+        "reason": reason,
+    }
+
+
+def estimate_microalbumin_v3_style(raw_np, wb_np, pod_mask_bool, regression_model=None):
+    """
+    Approximate V3 behavior using the same core extraction as V2, with a
+    separate version label and trace fields for comparison.
+    """
+    candidate = dict(estimate_microalbumin_v2_style(raw_np, wb_np, pod_mask_bool, regression_model=regression_model))
+    candidate["version"] = "v3_style"
+    if candidate.get("reason"):
+        candidate["reason"] = str(candidate["reason"]).replace("v2", "v3")
+    return candidate
+
+
+def _resolve_legacy_microalbumin_conflict(v2_bin, v3_bin):
+    v2_bin = _nearest_allowed_micro_legacy_bin(v2_bin)
+    v3_bin = _nearest_allowed_micro_legacy_bin(v3_bin)
+    mean_candidate_bin = None
+    if v2_bin is not None and v3_bin is not None:
+        if float(v2_bin) == float(v3_bin):
+            return v2_bin, v3_bin, float(v2_bin), "agreement", None
+        mean_candidate_bin = (float(v2_bin) + float(v3_bin)) / 2.0
+        return v2_bin, v3_bin, _nearest_allowed_micro_legacy_bin(mean_candidate_bin), "conflict_average_bin", mean_candidate_bin
+    if v2_bin is not None or v3_bin is not None:
+        return v2_bin, v3_bin, float(v2_bin if v2_bin is not None else v3_bin), "single_candidate_available", None
+    return v2_bin, v3_bin, None, "no_candidate_available", None
+
+
+def _select_higher_legacy_uacr(uacr_v2, uacr_v3, uacr_recovered):
+    candidates = [
+        ("average_bin_recovered", uacr_recovered, 0),
+        ("v3_style", uacr_v3, 1),
+        ("v2_style", uacr_v2, 2),
+    ]
+    numeric = []
+    for source, value, tie_rank in candidates:
+        f = _safe_json_float(value)
+        if f is not None:
+            numeric.append((f, -tie_rank, source))
+    if not numeric:
+        return None, None
+    numeric.sort(reverse=True)
+    selected_uacr, _, source = numeric[0]
+    return selected_uacr, source
+
+
+def stage_uacr_value(uacr_mg_g):
+    if uacr_mg_g is None:
+        return {"uacr_stage": "Unconfirmed", "uacr_stage_code": "unconfirmed"}
+    if uacr_mg_g < 30:
+        return {"uacr_stage": "A1 / normal to mildly increased", "uacr_stage_code": "A1"}
+    if uacr_mg_g <= 300:
+        return {"uacr_stage": "A2 / moderately increased", "uacr_stage_code": "A2"}
+    return {"uacr_stage": "A3 / severely increased", "uacr_stage_code": "A3"}
+
+
+def recover_microalbumin_from_legacy_when_unconfirmed(
+    raw_np,
+    wb_np,
+    pod_mask_bool,
+    creatinine_mg_dl,
+    v4_guard,
+    regression_model=None,
+    allow_liberal=True,
+):
+    """
+    Experimental fallback used only when V4 microalbumin result is unconfirmed.
+
+    It computes V2/V3-style estimates, maps them to allowed bins, resolves
+    conflicts by average-bin policy, computes direct UACR values, and selects
+    the higher UACR for display. This function must not be used for normal V4
+    exact/guarded/provisional/high-watch cases.
+    """
+    warning = (
+        "Legacy recovery used liberal acceptance after V4 unconfirmed and selected "
+        "the higher UACR among V2/V3/recovered candidates."
+    )
+    base = {
+        "triggered_by": "v4_unconfirmed",
+        "enabled": bool(ENABLE_MICROALBUMIN_UNCONFIRMED_LEGACY_RECOVERY),
+        "mode": MICRO_LEGACY_RECOVERY_MODE,
+        "accepted": False,
+        "v4_original_action": str((v4_guard or {}).get("action", "")),
+        "v4_original_report_mode": str((v4_guard or {}).get("report_mode", "")),
+        "v4_original_corrected_albumin_value": _safe_json_float((v4_guard or {}).get("corrected_albumin_value")),
+        "v2_candidate": None,
+        "v3_candidate": None,
+        "v2_bin": None,
+        "v3_bin": None,
+        "mean_candidate_bin": None,
+        "recovered_albumin_bin": None,
+        "conflict_status": "not_evaluated",
+        "uacr_v2": None,
+        "uacr_v3": None,
+        "uacr_recovered": None,
+        "selected_uacr": None,
+        "selected_uacr_source": None,
+        "uacr_policy": "higher_uacr_selected",
+        "final_report_mode": "unconfirmed",
+        "final_action": "legacy_recovery_not_accepted",
+        "warning": warning,
+        "debug": {
+            "accept_ood": bool(MICRO_LEGACY_RECOVERY_ACCEPT_OOD),
+            "accept_low_confidence": bool(MICRO_LEGACY_RECOVERY_ACCEPT_LOW_CONFIDENCE),
+            "min_chartlike_de": float(MICRO_LEGACY_RECOVERY_MIN_CHARTLIKE_DE),
+            "conflict_policy": MICRO_LEGACY_RECOVERY_CONFLICT_POLICY,
+            "allowed_bins": [int(x) for x in MICRO_LEGACY_RECOVERY_ALLOWED_BINS],
+            "allow_liberal": bool(allow_liberal),
+        },
+    }
+    if not ENABLE_MICROALBUMIN_UNCONFIRMED_LEGACY_RECOVERY:
+        base["final_action"] = "legacy_recovery_disabled"
+        return base
+    if str((v4_guard or {}).get("report_mode")) != "unconfirmed":
+        base["triggered_by"] = "not_v4_unconfirmed"
+        base["final_action"] = "legacy_recovery_skipped_non_unconfirmed_v4"
+        return base
+    if pod_mask_bool is None:
+        base["final_action"] = "legacy_recovery_missing_mask"
+        base["conflict_status"] = "no_candidate_available"
+        return base
+    try:
+        valid_pixels = int(eroded_mask(np.asarray(pod_mask_bool, dtype=bool)).sum())
+    except Exception:
+        base["final_action"] = "legacy_recovery_invalid_mask"
+        base["conflict_status"] = "no_candidate_available"
+        return base
+    if valid_pixels < MICRO_SHADE_MIN_PIXELS:
+        base["final_action"] = "legacy_recovery_insufficient_mask_pixels"
+        base["conflict_status"] = "no_candidate_available"
+        return base
+    creatinine = _safe_json_float(creatinine_mg_dl)
+    if creatinine is None or creatinine <= 0:
+        base["final_action"] = "legacy_recovery_invalid_creatinine"
+        base["conflict_status"] = "no_candidate_available"
+        return base
+
+    try:
+        v2_candidate = estimate_microalbumin_v2_style(raw_np, wb_np, pod_mask_bool, regression_model=regression_model)
+        v3_candidate = estimate_microalbumin_v3_style(raw_np, wb_np, pod_mask_bool, regression_model=regression_model)
+    except Exception as exc:
+        base["v2_candidate"] = _empty_legacy_candidate("v2_style", f"fatal_exception: {type(exc).__name__}")
+        base["v3_candidate"] = _empty_legacy_candidate("v3_style", f"fatal_exception: {type(exc).__name__}")
+        base["final_action"] = "legacy_recovery_feature_extraction_exception"
+        base["conflict_status"] = "no_candidate_available"
+        return base
+
+    v2_bin, v3_bin, recovered_bin, conflict_status, mean_candidate_bin = _resolve_legacy_microalbumin_conflict(
+        (v2_candidate or {}).get("mapped_albumin_bin"),
+        (v3_candidate or {}).get("mapped_albumin_bin"),
+    )
+    uacr_v2 = None if v2_bin is None else 100.0 * float(v2_bin) / creatinine
+    uacr_v3 = None if v3_bin is None else 100.0 * float(v3_bin) / creatinine
+    uacr_recovered = None if recovered_bin is None else 100.0 * float(recovered_bin) / creatinine
+    selected_uacr, selected_source = _select_higher_legacy_uacr(uacr_v2, uacr_v3, uacr_recovered)
+    accepted = bool(allow_liberal and recovered_bin is not None and selected_uacr is not None)
+
+    base.update({
+        "accepted": accepted,
+        "v2_candidate": v2_candidate,
+        "v3_candidate": v3_candidate,
+        "v2_bin": _safe_json_float(v2_bin),
+        "v3_bin": _safe_json_float(v3_bin),
+        "mean_candidate_bin": _safe_json_float(mean_candidate_bin),
+        "recovered_albumin_bin": _safe_json_float(recovered_bin),
+        "conflict_status": conflict_status,
+        "uacr_v2": _safe_json_float(uacr_v2),
+        "uacr_v3": _safe_json_float(uacr_v3),
+        "uacr_recovered": _safe_json_float(uacr_recovered),
+        "selected_uacr": _safe_json_float(selected_uacr),
+        "selected_uacr_source": selected_source,
+        "final_report_mode": "legacy_recovered" if accepted else "unconfirmed",
+        "final_action": "legacy_recovery_after_v4_unconfirmed" if accepted else "legacy_recovery_no_candidate_available",
+    })
+    return base
+
 # ───────────────────────────────
 # Color Charts & Reference Values
 # ───────────────────────────────
@@ -1370,11 +1653,22 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
             report_mode = q.get("microalbumin_report_mode", "exact")
             if report_mode == "provisional_range":
                 disp2 = q.get("microalbumin_display_text", "Provisional / retest")
+            elif report_mode == "legacy_recovered":
+                recovered = q.get("final_display_value_after_legacy_recovery", q.get("final_display_value"))
+                disp2 = q.get("microalbumin_display_text", f"Legacy recovered: {recovered} mg/L")
             elif report_mode == "unconfirmed":
                 disp2 = "Unconfirmed / retake image"
             else:
                 disp2 = q.get("microalbumin_display_text", disp2)
             guard_scenario = (q.get("guarded_uacr_scenario") or {}).get("provisional_guard_scenario", "n/a")
+            recovery_line = ""
+            if report_mode == "legacy_recovered":
+                result = q.get("legacy_recovery_result") or {}
+                recovery_line = (
+                    f"\nV4: Unconfirmed"
+                    f"\nRecovery: V2/V3 liberal average-bin"
+                    f"\nUACR source: {result.get('selected_uacr_source', 'n/a')}"
+                )
             p2_guard_suffix = (
                 f"\nShade guard: {action}"
                 f"\nLow evidence: {low_pct:.1f}%"
@@ -1385,6 +1679,7 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
                 f"\nMedian L*: {median_l:.1f}"
                 f"\n{low_visual_line}"
                 f"\nGuard scenario: {guard_scenario}"
+                f"{recovery_line}"
             )
     axs[2].imshow(patch2, interpolation='nearest'); axs[2].axis('off'); axs[2].set_title(f"Microalbumin\n{disp2}\nRGB{tuple(p2_mean_display)}{p2_quality_suffix}{p2_guard_suffix}")
 
@@ -1401,6 +1696,13 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
             suptitle = f"UACR Result\n{uacr_display}\nGuarded UACR range: {guarded_range}\nAlbumin guard range: {albumin_range_txt}\nExact albumin: not finalized{conf_text}"
         elif uacr_mode == "unconfirmed":
             suptitle = f"UACR Result\nUnconfirmed / retake image{conf_text}"
+        elif uacr_mode == "legacy_recovered":
+            val = (uacr_report_payload or {}).get("uacr_value")
+            stage_code = (uacr_report_payload or {}).get("uacr_stage_code")
+            source = (uacr_report_payload or {}).get("legacy_recovered_uacr_source")
+            source_note = "\nUACR selected from higher legacy candidate" if source in ("v2_style", "v3_style") else ""
+            val_line = f"{val:.2f} mg/g" if val is not None else "Unavailable"
+            suptitle = f"UACR Result\nLegacy recovered: {val_line}, {stage_code or 'Unconfirmed'}{source_note}\nNot V4 confirmed{conf_text}"
         else:
             ref_range = (uacr_report_payload or {}).get("uacr_reference_range")
             val = (uacr_report_payload or {}).get("uacr_value")
@@ -1531,11 +1833,49 @@ def process_image_and_get_pods(image_path, model, device):
     c2_display_text = microalbumin_report_display["microalbumin_display_text"]
     c2_range = microalbumin_report_display["microalbumin_range_mg_l"]
 
+    microalbumin_report_mode_before_legacy_recovery = c2_report_mode
+    final_display_value_before_legacy_recovery = c2_final_exact
+    legacy_recovery_attempted = bool(
+        ENABLE_MICROALBUMIN_UNCONFIRMED_LEGACY_RECOVERY
+        and albumin_shade_guard.get("report_mode") == "unconfirmed"
+    )
+    legacy_recovery_result = None
+    if legacy_recovery_attempted:
+        legacy_recovery_result = recover_microalbumin_from_legacy_when_unconfirmed(
+            raw_np,
+            wb_np,
+            pod2_mask,
+            c1_snapped,
+            albumin_shade_guard,
+            regression_model=model_micro,
+            allow_liberal=True,
+        )
+        if legacy_recovery_result.get("accepted"):
+            c2_final_exact = legacy_recovery_result.get("recovered_albumin_bin")
+            c2_report_mode = "legacy_recovered"
+            c2_display_text = (
+                f"Legacy recovered: {float(c2_final_exact):.0f} mg/L\n"
+                "V4: Unconfirmed\n"
+                "Recovery: V2/V3 liberal average-bin"
+            )
+            c2_range = None
+
+    final_display_value_after_legacy_recovery = c2_final_exact
+    microalbumin_report_mode_after_legacy_recovery = c2_report_mode
+
     # Preserve legacy behavior trace (continuous calibrated values) and corrected
     # behavior trace (snapped/displayed values) to avoid disruption in existing flow.
     uacr_legacy_value, _, _, _ = calculate_uacr_and_category(c2, c1)
     guarded_uacr_range_mg_g = None
     guarded_albumin_range_mg_l = None
+    if microalbumin_report_mode_before_legacy_recovery in ("exact", "guarded_exact"):
+        uacr_report_mode_before_legacy_recovery = "exact"
+    elif microalbumin_report_mode_before_legacy_recovery == "high_watch":
+        uacr_report_mode_before_legacy_recovery = "high_watch"
+    elif microalbumin_report_mode_before_legacy_recovery == "provisional_range":
+        uacr_report_mode_before_legacy_recovery = "provisional_range"
+    else:
+        uacr_report_mode_before_legacy_recovery = "unconfirmed"
     if c2_report_mode in ("exact", "guarded_exact") and c2_final_exact is not None:
         uacr_value, uacr_stage, uacr_range, uacr_display = calculate_uacr_and_category(c2_final_exact, c1_snapped)
         c2_report_mode_for_uacr = "exact"
@@ -1543,6 +1883,19 @@ def process_image_and_get_pods(image_path, model, device):
         uacr_value, uacr_stage, uacr_range, exact_uacr_display = calculate_uacr_and_category(c2_final_exact, c1_snapped)
         uacr_display = f"{exact_uacr_display} (High-watch / retest recommended)"
         c2_report_mode_for_uacr = "high_watch"
+    elif c2_report_mode == "legacy_recovered":
+        uacr_value = legacy_recovery_result.get("selected_uacr") if legacy_recovery_result else None
+        staged = stage_uacr_value(uacr_value)
+        uacr_stage = staged["uacr_stage"]
+        uacr_stage_code = staged["uacr_stage_code"]
+        uacr_range = uacr_stage
+        uacr_display = f"{float(uacr_value):.2f} mg/g, {uacr_stage_code}" if uacr_value is not None else "Unconfirmed / retake image"
+        source = legacy_recovery_result.get("selected_uacr_source") if legacy_recovery_result else None
+        if source in ("v2_style", "v3_style"):
+            uacr_display = f"{uacr_display} (UACR selected from higher legacy candidate)"
+        guarded_uacr_range_mg_g = None
+        guarded_albumin_range_mg_l = None
+        c2_report_mode_for_uacr = "legacy_recovered"
     elif c2_report_mode == "provisional_range":
         uacr_value = None
         uacr_stage = albumin_guarded_scenario["provisional_uacr_stage"]
@@ -1598,8 +1951,16 @@ def process_image_and_get_pods(image_path, model, device):
                 'guarded_uacr_scenario': albumin_guarded_scenario,
                 'microalbumin_report_mode': c2_report_mode,
                 'microalbumin_provisional_range_mg_l': albumin_shade_guard.get('provisional_albumin_range_mg_l'),
-                'microalbumin_reporting_note': 'Microalbumin value was finalized, guarded, provisional, high-watch, or unconfirmed according to shade evidence.',
                 'microalbumin_display_text': c2_display_text,
+                'legacy_recovery_attempted': legacy_recovery_attempted,
+                'legacy_recovery_enabled': ENABLE_MICROALBUMIN_UNCONFIRMED_LEGACY_RECOVERY,
+                'legacy_recovery_mode': MICRO_LEGACY_RECOVERY_MODE,
+                'legacy_recovery_result': legacy_recovery_result,
+                'final_display_value_before_legacy_recovery': final_display_value_before_legacy_recovery,
+                'final_display_value_after_legacy_recovery': final_display_value_after_legacy_recovery,
+                'microalbumin_report_mode_before_legacy_recovery': microalbumin_report_mode_before_legacy_recovery,
+                'microalbumin_report_mode_after_legacy_recovery': microalbumin_report_mode_after_legacy_recovery,
+                'microalbumin_reporting_note': 'V4 returned unconfirmed. Experimental V2/V3 legacy recovery was attempted. Result is liberal and must be interpreted as legacy-recovered, not V4-confirmed.' if legacy_recovery_attempted else 'Microalbumin value was finalized, guarded, provisional, high-watch, or unconfirmed according to shade evidence.',
             },
         },
         uacr_confidence=uacr_confidence,
@@ -1610,6 +1971,8 @@ def process_image_and_get_pods(image_path, model, device):
             "uacr_guarded_albumin_range_mg_l": guarded_albumin_range_mg_l,
             "uacr_guarded_range_mg_g": guarded_uacr_range_mg_g,
             "uacr_warning": "Microalbumin is high-watch; retest recommended." if c2_report_mode_for_uacr == "high_watch" else None,
+            "uacr_stage_code": locals().get("uacr_stage_code"),
+            "legacy_recovered_uacr_source": (legacy_recovery_result or {}).get("selected_uacr_source") if legacy_recovery_result else None,
         },
     )
     
@@ -1627,6 +1990,11 @@ def process_image_and_get_pods(image_path, model, device):
         'uacr_retest_recommended': bool(microalbumin_report_display["retest_recommended"]),
         'uacr_warning': 'Microalbumin is high-watch; retest recommended.' if c2_report_mode_for_uacr == 'high_watch' else None,
         'uacr_reporting_note': 'Provisional UACR ranges are triage-only and require retest when exact microalbumin is not finalized.',
+        'uacr_report_mode_before_legacy_recovery': uacr_report_mode_before_legacy_recovery,
+        'uacr_report_mode_after_legacy_recovery': c2_report_mode_for_uacr,
+        'legacy_recovered_uacr_value': (legacy_recovery_result or {}).get('selected_uacr') if legacy_recovery_result else None,
+        'legacy_recovered_uacr_source': (legacy_recovery_result or {}).get('selected_uacr_source') if legacy_recovery_result else None,
+        'legacy_recovery_warning': 'Legacy recovery used liberal acceptance after V4 unconfirmed and selected the higher UACR among V2/V3/recovered candidates.' if legacy_recovery_attempted else None,
         # Traceability fields to preserve legacy vs corrected outputs.
         'uacr_legacy_value': uacr_legacy_value,
         'uacr_corrected_value': uacr_value,
@@ -1635,6 +2003,14 @@ def process_image_and_get_pods(image_path, model, device):
         'uacr_corrected_trace': (
             build_uacr_trace(c2_final_exact, c1_snapped, uacr_value, 'corrected_exact_with_microalbumin_shade_guard')
             if c2_report_mode_for_uacr in ("exact", "high_watch") else
+            {
+                "trace_type": "legacy_recovered_after_v4_unconfirmed",
+                "albumin_value": c2_final_exact,
+                "creatinine_mg_dl": c1_snapped,
+                "uacr_value": uacr_value,
+                "selected_uacr_source": (legacy_recovery_result or {}).get("selected_uacr_source"),
+                "source_guard_action": albumin_shade_guard.get("action"),
+            } if c2_report_mode_for_uacr == "legacy_recovered" else
             {
                 "trace_type": "provisional_range_with_microalbumin_shade_guard",
                 "albumin_range_mg_l": guarded_albumin_range_mg_l,
@@ -1683,8 +2059,16 @@ def process_image_and_get_pods(image_path, model, device):
                 'guarded_uacr_scenario': albumin_guarded_scenario,
                 'microalbumin_report_mode': c2_report_mode,
                 'microalbumin_provisional_range_mg_l': albumin_shade_guard.get('provisional_albumin_range_mg_l'),
-                'microalbumin_reporting_note': 'Microalbumin value was finalized, guarded, provisional, high-watch, or unconfirmed according to shade evidence.',
+                'microalbumin_reporting_note': 'V4 returned unconfirmed. Experimental V2/V3 legacy recovery was attempted. Result is liberal and must be interpreted as legacy-recovered, not V4-confirmed.' if legacy_recovery_attempted else 'Microalbumin value was finalized, guarded, provisional, high-watch, or unconfirmed according to shade evidence.',
                 'microalbumin_display_text': c2_display_text,
+                'legacy_recovery_attempted': legacy_recovery_attempted,
+                'legacy_recovery_enabled': ENABLE_MICROALBUMIN_UNCONFIRMED_LEGACY_RECOVERY,
+                'legacy_recovery_mode': MICRO_LEGACY_RECOVERY_MODE,
+                'legacy_recovery_result': legacy_recovery_result,
+                'final_display_value_before_legacy_recovery': final_display_value_before_legacy_recovery,
+                'final_display_value_after_legacy_recovery': final_display_value_after_legacy_recovery,
+                'microalbumin_report_mode_before_legacy_recovery': microalbumin_report_mode_before_legacy_recovery,
+                'microalbumin_report_mode_after_legacy_recovery': microalbumin_report_mode_after_legacy_recovery,
                 'microalbumin_report_range_mg_l': c2_range,
                 'retest_recommended': microalbumin_report_display["retest_recommended"],
                 'reporting_note': 'Exact microalbumin value is not finalized when guard evidence is unconfirmed or ambiguous; a provisional range is shown for A1/A2 triage only.',
