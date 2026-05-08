@@ -49,8 +49,21 @@ MICRO_LOW_DE_RELAXED_MAX = 11.5
 MICRO_LOW_PIXEL_FRACTION_RELAXED_MIN = 0.07
 MICRO_LOW_VS_AQUA_MARGIN_MIN = 0.4
 
-MICRO_WEAK_AQUA_MIN = 0.25
-MICRO_WEAK_AQUA_DE_MAX = 13.0
+# New faint weak aqua tier: low-compatible
+MICRO_WEAK_AQUA_LOW_MIN = 0.03
+MICRO_WEAK_AQUA_LOW_MAX = 0.22
+MICRO_WEAK_AQUA_LOW_DE_MAX = 15.0
+MICRO_WEAK_AQUA_LOW_LOW_SUPPORT_MIN = 0.07
+MICRO_WEAK_AQUA_LOW_MARGIN_TOL = 2.0
+
+# Rename/reinterpret old weak aqua as moderate aqua.
+MICRO_MODERATE_AQUA_MIN = 0.25
+MICRO_MODERATE_AQUA_DE_MAX = 13.0
+MICRO_MODERATE_AQUA_LOW_SUPPRESSION_MAX = 0.06
+
+# Legacy weak-aqua names retained as aliases for downstream compatibility.
+MICRO_WEAK_AQUA_MIN = MICRO_MODERATE_AQUA_MIN
+MICRO_WEAK_AQUA_DE_MAX = MICRO_MODERATE_AQUA_DE_MAX
 
 MICRO_STRONG_AQUA_MIN = 0.30
 MICRO_STRONG_AQUA_DE_MAX = 11.0
@@ -405,8 +418,13 @@ def microalbumin_shade_sanity_check(
             "median_de_150": float(kwargs.get("median_de_150", 0.0)),
             "median_aqua_de": float(kwargs.get("median_aqua_de", 0.0)),
             "aqua_margin": float(kwargs.get("aqua_margin", 0.0)),
-            "weak_aqua_present": bool(kwargs.get("weak_aqua_present", False)),
+            "weak_aqua_present": bool(kwargs.get("moderate_aqua_present", kwargs.get("weak_aqua_present", False))),
+            "legacy_weak_aqua_present_alias": bool(kwargs.get("moderate_aqua_present", kwargs.get("weak_aqua_present", False))),
+            "weak_aqua_low_compatible": bool(kwargs.get("weak_aqua_low_compatible", False)),
+            "very_low_moderate_aqua": bool(kwargs.get("very_low_moderate_aqua", False)),
+            "moderate_aqua_present": bool(kwargs.get("moderate_aqua_present", kwargs.get("weak_aqua_present", False))),
             "strong_aqua_confirmed": bool(kwargs.get("strong_aqua_confirmed", False)),
+            "aqua_evidence_tier": str(kwargs.get("aqua_evidence_tier", "none")),
             "aqua_pixel_fraction": float(kwargs.get("aqua_pixel_fraction", 0.0)),
             "strong_aqua_candidate_bin": None if strong_bin is None else int(strong_bin),
             "strong_aqua_candidate_de": _safe_float(kwargs.get("strong_aqua_candidate_de")),
@@ -418,6 +436,12 @@ def microalbumin_shade_sanity_check(
             "nearest_vs_second_margin": _safe_float(kwargs.get("nearest_vs_second_margin")),
             "high_value_verification_reason": str(kwargs.get("high_value_verification_reason", "")),
             "weak_aqua_threshold_used": float(MICRO_WEAK_AQUA_MIN),
+            "weak_aqua_low_range": [float(MICRO_WEAK_AQUA_LOW_MIN), float(MICRO_WEAK_AQUA_LOW_MAX)],
+            "moderate_aqua_threshold": float(MICRO_MODERATE_AQUA_MIN),
+            "moderate_aqua_de_max": float(MICRO_MODERATE_AQUA_DE_MAX),
+            "weak_aqua_low_reason": str(kwargs.get("weak_aqua_low_reason", "")),
+            "moderate_aqua_reason": str(kwargs.get("moderate_aqua_reason", "")),
+            "aqua_tier_reporting_note": "Aqua evidence is tiered as weak-low-compatible, very-low-moderate-low-compatible, moderate, or strong. Moderate aqua replaces the previous weak-aqua-to-80/150 behavior.",
             "strong_aqua_threshold_used": float(MICRO_STRONG_AQUA_MIN),
             "strong_aqua_de_max_used": float(MICRO_STRONG_AQUA_DE_MAX),
             "high_value_confirmed_by_aqua": bool(kwargs.get("strong_aqua_confirmed_for_high", False)),
@@ -465,8 +489,15 @@ def microalbumin_shade_sanity_check(
         "median_aqua_de": 0.0,
         "aqua_margin": 0.0,
         "weak_aqua_present": False,
+        "legacy_weak_aqua_present_alias": False,
+        "weak_aqua_low_compatible": False,
+        "very_low_moderate_aqua": False,
+        "moderate_aqua_present": False,
         "strong_aqua_confirmed": False,
+        "aqua_evidence_tier": "none",
         "aqua_pixel_fraction": 0.0,
+        "weak_aqua_low_reason": "",
+        "moderate_aqua_reason": "",
         "strong_aqua_candidate_bin": None,
         "strong_aqua_candidate_de": None,
         "high_value_color_verified": False,
@@ -570,17 +601,57 @@ def microalbumin_shade_sanity_check(
     current_is_high_watch = MICRO_HIGH_WATCH_MIN <= current_value_float < MICRO_VERY_HIGH_GUARD_MIN
     current_is_very_high = current_value_float >= MICRO_VERY_HIGH_GUARD_MIN
 
-    weak_aqua_present = bool(
+    weak_aqua_low_compatible = bool(
         current_value_float < MICRO_HIGH_VERIFY_MIN_VALUE
-        and aqua_pixel_fraction >= MICRO_WEAK_AQUA_MIN
-        and median_aqua_de <= MICRO_WEAK_AQUA_DE_MAX
+        and MICRO_WEAK_AQUA_LOW_MIN <= aqua_pixel_fraction <= MICRO_WEAK_AQUA_LOW_MAX
+        and median_aqua_de <= MICRO_WEAK_AQUA_LOW_DE_MAX
+        and low_pixel_fraction >= MICRO_WEAK_AQUA_LOW_LOW_SUPPORT_MIN
+        and median_low_de <= median_aqua_de + MICRO_WEAK_AQUA_LOW_MARGIN_TOL
     )
+    moderate_aqua_present = bool(
+        current_value_float < MICRO_HIGH_VERIFY_MIN_VALUE
+        and aqua_pixel_fraction >= MICRO_MODERATE_AQUA_MIN
+        and median_aqua_de <= MICRO_MODERATE_AQUA_DE_MAX
+        and low_pixel_fraction <= MICRO_MODERATE_AQUA_LOW_SUPPRESSION_MAX
+    )
+    very_low_moderate_aqua = bool(
+        current_value_float < MICRO_HIGH_VERIFY_MIN_VALUE
+        and aqua_pixel_fraction >= MICRO_WEAK_AQUA_LOW_MAX
+        and aqua_pixel_fraction < MICRO_MODERATE_AQUA_MIN
+        and median_aqua_de <= MICRO_MODERATE_AQUA_DE_MAX
+        and low_pixel_fraction >= MICRO_WEAK_AQUA_LOW_LOW_SUPPORT_MIN
+        and median_low_de <= median_aqua_de + MICRO_WEAK_AQUA_LOW_MARGIN_TOL
+    )
+    # Backward-compatible alias: previous weak-aqua-to-80/150 behavior is now moderate aqua.
+    weak_aqua_present = moderate_aqua_present
     strong_aqua_confirmed = bool(
         current_value_float < MICRO_HIGH_VERIFY_MIN_VALUE
         and aqua_pixel_fraction >= MICRO_STRONG_AQUA_MIN
         and median_aqua_de <= MICRO_STRONG_AQUA_DE_MAX
         and median_aqua_de + MICRO_AQUA_ADVANTAGE_MARGIN < median_low_de
     )
+    if strong_aqua_confirmed:
+        aqua_evidence_tier = "strong"
+    elif moderate_aqua_present:
+        aqua_evidence_tier = "moderate"
+    elif very_low_moderate_aqua:
+        aqua_evidence_tier = "very_low_moderate_low_compatible"
+    elif weak_aqua_low_compatible:
+        aqua_evidence_tier = "weak_low_compatible"
+    else:
+        aqua_evidence_tier = "none"
+
+    weak_aqua_low_reason = (
+        "Faint aqua evidence is low-compatible because low-shade evidence is present and competitive."
+        if weak_aqua_low_compatible else
+        "Weak low-compatible aqua criteria were not met."
+    )
+    moderate_aqua_reason = (
+        "Moderate aqua evidence is present with suppressed low-shade support."
+        if moderate_aqua_present else
+        "Moderate aqua criteria were not met."
+    )
+
     overbright_not_chart_like = bool(
         median_L >= MICRO_OVERBRIGHT_L_MAX
         and not low_shade_confirmed
@@ -657,8 +728,15 @@ def microalbumin_shade_sanity_check(
         "median_aqua_de": median_aqua_de,
         "aqua_margin": aqua_margin,
         "weak_aqua_present": weak_aqua_present,
+        "legacy_weak_aqua_present_alias": moderate_aqua_present,
+        "weak_aqua_low_compatible": weak_aqua_low_compatible,
+        "very_low_moderate_aqua": very_low_moderate_aqua,
+        "moderate_aqua_present": moderate_aqua_present,
         "strong_aqua_confirmed": strong_aqua_confirmed,
+        "aqua_evidence_tier": aqua_evidence_tier,
         "aqua_pixel_fraction": aqua_pixel_fraction,
+        "weak_aqua_low_reason": weak_aqua_low_reason,
+        "moderate_aqua_reason": moderate_aqua_reason,
         "strong_aqua_candidate_bin": strong_aqua_candidate_bin,
         "strong_aqua_candidate_de": None if strong_aqua_candidate_de is None else float(strong_aqua_candidate_de),
         "high_value_color_verified": high_value_color_verified,
@@ -699,13 +777,41 @@ def microalbumin_shade_sanity_check(
             guard_reason = (
                 "Strict low-shade evidence confirmed; exact 3/10/30 mg/L selected."
             )
+        elif (
+            (low_shade_confirmed_relaxed or low_shade_confirmed)
+            and weak_aqua_low_compatible
+            and not strong_aqua_confirmed
+            and not moderate_aqua_present
+        ):
+            corrected_albumin_value = float(low_candidate_class_mg_l)
+            report_mode = "guarded_exact"
+            guard_applied = current_value_float != corrected_albumin_value
+            action = "weak_aqua_low_compatible_mapped_to_low"
+            guard_reason = (
+                "Faint weak-aqua evidence was present, but low-shade evidence supported a <30 mg/L class; "
+                "microalbumin was mapped to the nearest low class 3/10/30 mg/L."
+            )
+        elif (
+            (low_shade_confirmed_relaxed or low_shade_confirmed)
+            and very_low_moderate_aqua
+            and not strong_aqua_confirmed
+            and not moderate_aqua_present
+        ):
+            corrected_albumin_value = float(low_candidate_class_mg_l)
+            report_mode = "guarded_exact"
+            guard_applied = current_value_float != corrected_albumin_value
+            action = "very_low_moderate_aqua_with_low_evidence_mapped_to_low"
+            guard_reason = (
+                "Very-low moderate aqua evidence was present, but low-shade evidence remained competitive; "
+                "microalbumin was mapped to the nearest low class 3/10/30 mg/L."
+            )
         elif low_shade_confirmed_relaxed and not strong_aqua_confirmed:
             corrected_albumin_value = float(low_candidate_class_mg_l)
             report_mode = "guarded_exact"
             guard_applied = current_value_float != corrected_albumin_value
             action = "relaxed_low_guard_below_400"
             guard_reason = (
-                "Relaxed low-shade evidence confirmed below 400 mg/L; weak aqua was not sufficient to override low evidence."
+                "Relaxed low-shade evidence confirmed below 400 mg/L; moderate aqua was not sufficient to override low evidence."
             )
         elif strong_aqua_confirmed:
             candidate, candidate_de = _nearest_micro_allowed_bin_lab(
@@ -719,14 +825,15 @@ def microalbumin_shade_sanity_check(
             guard_reason = (
                 f"Strong aqua evidence confirmed below 400 mg/L; nearest allowed bin selected as {candidate} mg/L."
             )
-        elif weak_aqua_present:
-            corrected_albumin_value = None
+        elif moderate_aqua_present and not strong_aqua_confirmed:
+            corrected_albumin_value = None if allow_unconfirmed else 80.0
             provisional_albumin_range_mg_l = (80.0, 150.0)
             report_mode = "provisional_range"
             guard_applied = True
-            action = "weak_aqua_below_400_provisional_80_150"
+            action = "moderate_aqua_provisional_80_150"
             guard_reason = (
-                "Weak aqua evidence present below 400 mg/L; provisional 80–150 mg/L used."
+                "Moderate aqua evidence is present without strong aqua; exact high value is not confirmed. "
+                "Provisional 80–150 mg/L range used."
             )
         else:
             corrected_albumin_value = current_value_float
@@ -834,6 +941,136 @@ def calculate_uacr_range_and_stage(albumin_range_mg_l, creatinine_mg_dl):
         "uacr_display": f"{round(uacr_low, 2):.2f}–{round(uacr_high, 2):.2f} mg/g",
         "uacr_stage": stage,
         "uacr_stage_code": code,
+    }
+
+
+def _safe_positive_float(value):
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out) or out <= 0:
+        return None
+    return out
+
+def _safe_nonnegative_float(value):
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out) or out < 0:
+        return None
+    return out
+
+def convert_creatinine_to_si(creatinine_mg_dl):
+    creatinine = _safe_positive_float(creatinine_mg_dl)
+    if creatinine is None:
+        return None
+    umol_l = creatinine * 88.4
+    mmol_l = creatinine * 0.0884
+    return {
+        "creatinine_mg_dl": round(creatinine, 2),
+        "creatinine_umol_l": round(umol_l, 2),
+        "creatinine_mmol_l": round(mmol_l, 4),
+        "creatinine_si_display": f"{umol_l:.0f} µmol/L",
+    }
+
+def convert_microalbumin_to_si(albumin_mg_l):
+    albumin = _safe_nonnegative_float(albumin_mg_l)
+    if albumin is None:
+        return None
+    g_l = albumin / 1000.0
+    return {
+        "microalbumin_mg_l": round(albumin, 2),
+        "microalbumin_g_l": round(g_l, 4),
+        "microalbumin_ug_ml": round(albumin, 2),
+        "microalbumin_si_display": f"{g_l:.3f} g/L",
+        "microalbumin_equivalent_display": f"{albumin:.0f} µg/mL",
+    }
+
+def stage_acr_si_mg_mmol(acr_mg_mmol):
+    acr = _safe_nonnegative_float(acr_mg_mmol)
+    if acr is None:
+        return {
+            "acr_si_stage": "Unconfirmed / retest",
+            "acr_si_stage_code": "unconfirmed",
+            "acr_si_reference_range": None,
+        }
+    if acr < 3:
+        return {
+            "acr_si_stage": "A1: Normal to mildly increased",
+            "acr_si_stage_code": "A1",
+            "acr_si_reference_range": "< 3 mg/mmol",
+        }
+    if acr <= 30:
+        return {
+            "acr_si_stage": "A2: Moderately increased",
+            "acr_si_stage_code": "A2",
+            "acr_si_reference_range": "3 - 30 mg/mmol",
+        }
+    return {
+        "acr_si_stage": "A3: Severely increased",
+        "acr_si_stage_code": "A3",
+        "acr_si_reference_range": "> 30 mg/mmol",
+    }
+
+def calculate_acr_si(albumin_mg_l, creatinine_mg_dl):
+    albumin = _safe_nonnegative_float(albumin_mg_l)
+    creatinine = _safe_positive_float(creatinine_mg_dl)
+    if albumin is None or creatinine is None:
+        staged = stage_acr_si_mg_mmol(None)
+        return {"acr_mg_mmol": None, "acr_si_display": "Unconfirmed / retest", **staged}
+    creatinine_mmol_l = creatinine * 0.0884
+    acr = albumin / creatinine_mmol_l
+    acr_rounded = round(acr, 2)
+    staged = stage_acr_si_mg_mmol(acr)
+    return {
+        "acr_mg_mmol": acr_rounded,
+        "acr_si_display": f"{acr_rounded:.2f} mg/mmol",
+        **staged,
+    }
+
+def calculate_acr_si_range(albumin_range_mg_l, creatinine_mg_dl):
+    creatinine = _safe_positive_float(creatinine_mg_dl)
+    if albumin_range_mg_l is None or creatinine is None:
+        return None
+    try:
+        low_albumin, high_albumin = albumin_range_mg_l
+        low_albumin = float(low_albumin)
+        high_albumin = float(high_albumin)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(x) for x in (low_albumin, high_albumin)):
+        return None
+    creatinine_mmol_l = creatinine * 0.0884
+    acr_low = low_albumin / creatinine_mmol_l
+    acr_high = high_albumin / creatinine_mmol_l
+    acr_low_rounded = round(acr_low, 2)
+    acr_high_rounded = round(acr_high, 2)
+    if acr_high < 3:
+        stage = "Provisional A1 / retest"
+        code = "A1_provisional"
+    elif acr_low >= 3 and acr_high <= 30:
+        stage = "Provisional A2 / retest"
+        code = "A2_provisional"
+    elif acr_low < 3 and acr_high <= 30:
+        stage = "Provisional A1/A2 boundary / retest"
+        code = "A1_A2_boundary_provisional"
+    elif acr_low <= 30 and acr_high > 30:
+        stage = "A2/A3 boundary unconfirmed / retest"
+        code = "A2_A3_boundary_unconfirmed"
+    else:
+        stage = "Unconfirmed / retest"
+        code = "unconfirmed"
+    return {
+        "acr_si_range_mg_mmol": (acr_low_rounded, acr_high_rounded),
+        "acr_si_range_display": f"{acr_low_rounded:.2f}–{acr_high_rounded:.2f} mg/mmol",
+        "acr_si_stage": stage,
+        "acr_si_stage_code": code,
     }
 
 def derive_microalbumin_guarded_uacr_scenario(
@@ -1625,6 +1862,9 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
     if pod_quality and pod_quality.get('creatinine'):
         q = pod_quality['creatinine']
         p1_quality_suffix = f"\nConf {q.get('confidence_pct', 'NA')}% ({q.get('confidence_bucket', 'NA')})"
+        cr_si = q.get('creatinine_si') or {}
+        if cr_si.get('creatinine_si_display'):
+            p1_quality_suffix = f"\n{cr_si.get('creatinine_si_display')}{p1_quality_suffix}"
     axs[1].imshow(patch1, interpolation='nearest'); axs[1].axis('off'); axs[1].set_title(f"Creatinine\n{disp1} mg/dL\nRGB{tuple(p1_mean_display)}{p1_quality_suffix}")
 
     patch2 = np.ones((50, 50, 3), np.uint8) * p2_mean_display.reshape(1, 1, 3)
@@ -1642,6 +1882,8 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
             low_visual = shade_guard.get('low_candidate_visual_name', 'n/a')
             low_confirmed = bool(shade_guard.get('low_shade_confirmed', False))
             weak_aqua = 'yes' if shade_guard.get('weak_aqua_present') else 'no'
+            moderate_aqua = 'yes' if shade_guard.get('moderate_aqua_present') else 'no'
+            aqua_tier = shade_guard.get('aqua_evidence_tier', 'none')
             strong_aqua = 'yes' if shade_guard.get('strong_aqua_confirmed') else 'no'
             overbright = 'yes' if shade_guard.get('overbright_not_chart_like') else 'no'
             median_l = float(shade_guard.get('median_L', 0.0))
@@ -1669,11 +1911,16 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
                     f"\nRecovery: V2/V3 liberal average-bin"
                     f"\nUACR source: {result.get('selected_uacr_source', 'n/a')}"
                 )
+            micro_si = q.get('microalbumin_si') or {}
+            if micro_si.get('microalbumin_si_display'):
+                disp2 = f"{disp2}\n{micro_si.get('microalbumin_si_display')}"
             p2_guard_suffix = (
                 f"\nShade guard: {action}"
                 f"\nLow evidence: {low_pct:.1f}%"
                 f"\nAqua evidence: {aqua_pct:.1f}%"
-                f"\nWeak aqua: {weak_aqua}"
+                f"\nWeak aqua(alias): {weak_aqua}"
+                f"\nModerate aqua: {moderate_aqua}"
+                f"\nAqua tier: {aqua_tier}"
                 f"\nStrong aqua: {strong_aqua}"
                 f"\nOverbright: {overbright}"
                 f"\nMedian L*: {median_l:.1f}"
@@ -1693,7 +1940,10 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
             albumin_range_txt = "Unavailable"
             if albumin_range:
                 albumin_range_txt = f"{albumin_range[0]:.0f}\u2013{albumin_range[1]:.0f} mg/L"
-            suptitle = f"UACR Result\n{uacr_display}\nGuarded UACR range: {guarded_range}\nAlbumin guard range: {albumin_range_txt}\nExact albumin: not finalized{conf_text}"
+            acr_si_range = (uacr_report_payload or {}).get("acr_si_range") or {}
+            si_range_line = f"\nACR SI range: {acr_si_range.get('acr_si_range_display')}" if acr_si_range.get('acr_si_range_display') else ""
+            si_stage_line = f"\n{acr_si_range.get('acr_si_stage')}" if acr_si_range.get('acr_si_stage') else ""
+            suptitle = f"UACR Result\n{uacr_display}{si_range_line}{si_stage_line}\nGuarded UACR range: {guarded_range}\nAlbumin guard range: {albumin_range_txt}\nExact albumin: not finalized{conf_text}"
         elif uacr_mode == "unconfirmed":
             suptitle = f"UACR Result\nUnconfirmed / retake image{conf_text}"
         elif uacr_mode == "legacy_recovered":
@@ -1707,8 +1957,11 @@ def save_composite_visual(raw_img, pod1_region, pod2_region,
             ref_range = (uacr_report_payload or {}).get("uacr_reference_range")
             val = (uacr_report_payload or {}).get("uacr_value")
             val_line = f"\nValue: {val:.2f} mg/G" if val is not None else ""
+            acr_si = (uacr_report_payload or {}).get("acr_si") or {}
+            si_line = f"\nACR SI: {acr_si.get('acr_si_display')}" if acr_si.get('acr_si_display') else ""
+            si_stage_line = f"\n{acr_si.get('acr_si_stage')}" if acr_si.get('acr_si_stage') else ""
             ref_line = f"\nReference Range: {ref_range}" if ref_range else ""
-            suptitle = f"UACR Result\n{uacr_display}{val_line}{ref_line}{conf_text}"
+            suptitle = f"UACR Result\n{uacr_display}{val_line}{si_line}{si_stage_line}{ref_line}{conf_text}"
         fig.suptitle(suptitle, fontsize=11, fontweight='bold', color=color, y=0.97)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.82])
@@ -1910,6 +2163,52 @@ def process_image_and_get_pods(image_path, model, device):
         uacr_range = "Unavailable"
         uacr_display = "Unconfirmed / retake image"
         c2_report_mode_for_uacr = "unconfirmed"
+    creatinine_si = convert_creatinine_to_si(c1_snapped)
+    if c2_report_mode_for_uacr in ("exact", "guarded_exact", "high_watch") and c2_final_exact is not None:
+        microalbumin_si = convert_microalbumin_to_si(c2_final_exact)
+        acr_si = calculate_acr_si(c2_final_exact, c1_snapped)
+        acr_si_range = None
+    elif c2_report_mode_for_uacr == "provisional_range":
+        microalbumin_si = None
+        if guarded_albumin_range_mg_l is not None:
+            low_g_l = float(guarded_albumin_range_mg_l[0]) / 1000.0
+            high_g_l = float(guarded_albumin_range_mg_l[1]) / 1000.0
+            microalbumin_si = {
+                "microalbumin_range_mg_l": tuple(float(x) for x in guarded_albumin_range_mg_l),
+                "microalbumin_range_g_l": (round(low_g_l, 4), round(high_g_l, 4)),
+                "microalbumin_si_display": f"{low_g_l:.3f}–{high_g_l:.3f} g/L",
+                "microalbumin_equivalent_display": f"{float(guarded_albumin_range_mg_l[0]):.0f}–{float(guarded_albumin_range_mg_l[1]):.0f} µg/mL",
+            }
+        acr_si = {
+            "acr_mg_mmol": None,
+            "acr_si_display": "Unconfirmed / retest",
+            **stage_acr_si_mg_mmol(None),
+        }
+        acr_si_range = calculate_acr_si_range(guarded_albumin_range_mg_l, c1_snapped)
+    else:
+        microalbumin_si = None
+        acr_si = {
+            "acr_mg_mmol": None,
+            "acr_si_display": "Unconfirmed / retest",
+            **stage_acr_si_mg_mmol(None),
+        }
+        acr_si_range = None
+
+    unit_systems = {
+        "conventional": {
+            "creatinine_unit": "mg/dL",
+            "microalbumin_unit": "mg/L",
+            "uacr_unit": "mg/g",
+        },
+        "si": {
+            "creatinine_unit": "µmol/L",
+            "creatinine_ratio_unit": "mmol/L",
+            "microalbumin_unit": "g/L",
+            "microalbumin_equivalent_unit": "µg/mL",
+            "acr_unit": "mg/mmol",
+        },
+    }
+
     uacr_confidence = round(min(pod1_conf['confidence'], pod2_conf['confidence']) * 100.0, 1)
     uacr_conf_bucket = 'High' if uacr_confidence >= 85 else 'Moderate' if uacr_confidence >= 65 else 'Low'
     uacr_delta = None if (uacr_legacy_value is None or uacr_value is None) else round(uacr_legacy_value - uacr_value, 2)
@@ -1942,7 +2241,7 @@ def process_image_and_get_pods(image_path, model, device):
         uacr_display,
         fpath,
         pod_quality={
-            'creatinine': pod1_conf,
+            'creatinine': {**pod1_conf, 'creatinine_si': creatinine_si},
             'microalbumin': {
                 **pod2_conf,
                 'final_display_value_before_shade_guard': c2_snapped,
@@ -1952,6 +2251,7 @@ def process_image_and_get_pods(image_path, model, device):
                 'microalbumin_report_mode': c2_report_mode,
                 'microalbumin_provisional_range_mg_l': albumin_shade_guard.get('provisional_albumin_range_mg_l'),
                 'microalbumin_display_text': c2_display_text,
+                'microalbumin_si': microalbumin_si,
                 'legacy_recovery_attempted': legacy_recovery_attempted,
                 'legacy_recovery_enabled': ENABLE_MICROALBUMIN_UNCONFIRMED_LEGACY_RECOVERY,
                 'legacy_recovery_mode': MICRO_LEGACY_RECOVERY_MODE,
@@ -1973,11 +2273,20 @@ def process_image_and_get_pods(image_path, model, device):
             "uacr_warning": "Microalbumin is high-watch; retest recommended." if c2_report_mode_for_uacr == "high_watch" else None,
             "uacr_stage_code": locals().get("uacr_stage_code"),
             "legacy_recovered_uacr_source": (legacy_recovery_result or {}).get("selected_uacr_source") if legacy_recovery_result else None,
+            "acr_si": acr_si,
+            "acr_si_range": acr_si_range,
+            "creatinine_si": creatinine_si,
+            "microalbumin_si": microalbumin_si,
         },
     )
     
     return {
         'composite_img': fname,
+        'unit_systems': unit_systems,
+        'creatinine_si': creatinine_si,
+        'microalbumin_si': microalbumin_si,
+        'acr_si': acr_si,
+        'acr_si_range': acr_si_range,
         # Corrected value aligned to displayed snapped analyte values.
         'uacr_report_mode': c2_report_mode_for_uacr,
         'uacr_value': uacr_value,
@@ -2041,6 +2350,7 @@ def process_image_and_get_pods(image_path, model, device):
                 'raw_color_chart_value': c1_color,
                 'raw_color_chart_label': c1_color_label,
                 'final_display_value': c1_snapped,
+                'creatinine_si': creatinine_si,
                 'low_end_snap_label': c1_low_end_label,
             },
             'microalbumin': {
@@ -2072,6 +2382,7 @@ def process_image_and_get_pods(image_path, model, device):
                 'microalbumin_report_range_mg_l': c2_range,
                 'retest_recommended': microalbumin_report_display["retest_recommended"],
                 'reporting_note': 'Exact microalbumin value is not finalized when guard evidence is unconfirmed or ambiguous; a provisional range is shown for A1/A2 triage only.',
+                'aqua_tier_reporting_note': 'Aqua evidence is tiered as weak-low-compatible, very-low-moderate-low-compatible, moderate, or strong. Moderate aqua replaces the previous weak-aqua-to-80/150 behavior.',
             },
         },
         'uacr_confidence_pct': uacr_confidence,
