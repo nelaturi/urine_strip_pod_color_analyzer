@@ -116,6 +116,9 @@
               <div class="card-body">
                 <h6 class="card-title">Creatinine Pod</h6>
                 <p class="mb-1"><strong>Value:</strong> {{ result.pod_quality.creatinine.final_display_value }} mg/dL</p>
+                {% if result.creatinine_si %}
+                <p class="mb-1"><strong>SI:</strong> {{ result.creatinine_si.creatinine_si_display }}</p>
+                {% endif %}
                 <p class="mb-1"><strong>Confidence:</strong> {{ result.pod_quality.creatinine.confidence_pct }}% ({{ result.pod_quality.creatinine.confidence_bucket }})</p>
                 <p class="mb-1"><strong>Flags:</strong>
                   {% set c_flags = [] %}
@@ -132,7 +135,13 @@
             <div class="card h-100">
               <div class="card-body">
                 <h6 class="card-title">Microalbumin Pod</h6>
-                <p class="mb-1"><strong>Value:</strong> {{ result.pod_quality.microalbumin.final_display_value }} mg/L</p>
+                <p class="mb-1"><strong>Value:</strong> {{ result.pod_quality.microalbumin.microalbumin_display_text or (result.pod_quality.microalbumin.final_display_value ~ ' mg/L') }}</p>
+                {% if result.microalbumin_si %}
+                <p class="mb-1"><strong>SI:</strong> {{ result.microalbumin_si.microalbumin_si_display }}</p>
+                {% if result.microalbumin_si.microalbumin_equivalent_display %}
+                <p class="mb-1"><strong>Equivalent:</strong> {{ result.microalbumin_si.microalbumin_equivalent_display }}</p>
+                {% endif %}
+                {% endif %}
                 <p class="mb-1"><strong>Confidence:</strong> {{ result.pod_quality.microalbumin.confidence_pct }}% ({{ result.pod_quality.microalbumin.confidence_bucket }})</p>
                 <p class="mb-1"><strong>Flags:</strong>
                   {% set m_flags = [] %}
@@ -171,7 +180,16 @@
               <tr>
                 <td>UACR value (mg/g)</td>
                 <td>{{ result.uacr_legacy_value if result.uacr_legacy_value is not none else 'NA' }}</td>
-                <td><strong>{{ result.uacr_corrected_value if result.uacr_corrected_value is not none else 'NA' }}</strong></td>
+                <td><strong>{{ result.uacr_corrected_value if result.uacr_corrected_value is not none else (result.uacr_guarded_range_mg_g[0] ~ '–' ~ result.uacr_guarded_range_mg_g[1] if result.uacr_guarded_range_mg_g else 'NA') }}</strong></td>
+              </tr>
+              <tr>
+                <td>ACR SI (mg/mmol)</td>
+                <td>NA</td>
+                <td><strong>{% if result.acr_si_range %}{{ result.acr_si_range.acr_si_range_display }}{% elif result.acr_si %}{{ result.acr_si.acr_si_display }}{% else %}NA{% endif %}</strong></td>
+              </tr>
+              <tr>
+                <td>A1/A2/A3 category</td>
+                <td colspan="2">{{ result.uacr_stage }}{% if result.acr_si_range %} / {{ result.acr_si_range.acr_si_stage }}{% elif result.acr_si %} / {{ result.acr_si.acr_si_stage }}{% endif %}</td>
               </tr>
               <tr>
                 <td>UACR confidence</td>
