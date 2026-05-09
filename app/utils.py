@@ -43,6 +43,14 @@ CREATININE_DELTAE_ACCEPT = 8.0  # accept creatinine centroid if best ΔE <= this
 MICRO_LOW_DE_MAX = 7.5
 MICRO_LOW_PIXEL_FRACTION_MIN = 0.40
 MICRO_LOW_MARGIN_AMBIGUOUS = 1.2
+MICRO_LOW_BIN_MARGIN_MIN = 0.75
+MICRO_LOW_BIN_SUPPORT_MIN = 0.10
+MICRO_LOW_BIN_SUPPORT_MARGIN_MIN = 0.03
+MICRO_LOW_30_ADVANTAGE_REQUIRED = 0.75
+MICRO_LOW_30_PIXEL_FRACTION_MIN = 0.18
+MICRO_LOW_AMBIGUOUS_DEFAULT_BIN = 10.0
+MICRO_LOW_3_CLEAR_ADVANTAGE_OVER_10 = 0.50
+MICRO_LOW_30_REQUIRE_CLEAR_EVIDENCE_WHEN_UACR_BOUNDARY = True
 
 # Below-400 balanced guard
 MICRO_LOW_DE_RELAXED_MAX = 11.5
@@ -424,6 +432,134 @@ def evaluate_microalbumin_aqua_tiers(
     }
 
 
+def _low_bin_value_from_mapping(mapping, bin_value, default=None):
+    if mapping is None:
+        return default
+    for key in (bin_value, str(bin_value), float(bin_value)):
+        if key in mapping:
+            return mapping[key]
+    return default
+
+
+def _jsonable_low_bin_fraction_map(low_pixel_fraction_by_class):
+    return {
+        str(bin_value): float(_low_bin_value_from_mapping(low_pixel_fraction_by_class, bin_value, 0.0) or 0.0)
+        for bin_value in (3, 10, 30)
+    }
+
+
+def select_low_albumin_bin_3_10_30(
+    median_de_low_by_class,
+    low_pixel_fraction_by_class=None,
+    creatinine_mg_dl=None,
+    branch_name=None,
+):
+    """
+    Select the final low microalbumin bin among 3, 10, and 30 mg/L.
+
+    This helper must only be used after the main guard has already accepted
+    the pod as low-family evidence.
+
+    It prevents all low-compatible cases from snapping to 30 mg/L.
+    """
+    allowed_bins = (3, 10, 30)
+    normalized_de = {}
+    for bin_value in allowed_bins:
+        raw_de = _low_bin_value_from_mapping(median_de_low_by_class, bin_value)
+        try:
+            parsed_de = float(raw_de)
+        except (TypeError, ValueError):
+            parsed_de = float("inf")
+        if not math.isfinite(parsed_de):
+            parsed_de = float("inf")
+        normalized_de[bin_value] = parsed_de
+
+    low_sorted = sorted(normalized_de.items(), key=lambda item: (item[1], item[0]))
+    nearest_low_bin = int(low_sorted[0][0])
+    nearest_low_de = float(low_sorted[0][1])
+    second_low_bin = int(low_sorted[1][0])
+    second_low_de = float(low_sorted[1][1])
+    low_bin_margin = float(second_low_de - nearest_low_de)
+    fractions = _jsonable_low_bin_fraction_map(low_pixel_fraction_by_class)
+
+    selected_low_bin = nearest_low_bin
+    selection_reason = "fallback_nearest_low_bin"
+    margin_is_clear = bool(low_bin_margin >= MICRO_LOW_BIN_MARGIN_MIN)
+    support_tiebreak_used = False
+
+    if margin_is_clear:
+        selection_reason = "clear_nearest_low_de"
+    else:
+        if low_pixel_fraction_by_class is not None:
+            support_sorted = sorted(
+                ((bin_value, fractions[str(bin_value)]) for bin_value in allowed_bins),
+                key=lambda item: (item[1], -item[0]),
+                reverse=True,
+            )
+            best_support_bin, best_support_fraction = support_sorted[0]
+            second_support_fraction = float(support_sorted[1][1])
+            support_margin = float(best_support_fraction - second_support_fraction)
+            if (
+                best_support_fraction >= MICRO_LOW_BIN_SUPPORT_MIN
+                and support_margin >= MICRO_LOW_BIN_SUPPORT_MARGIN_MIN
+            ):
+                selected_low_bin = int(best_support_bin)
+                selection_reason = "pixel_support_tiebreak"
+                support_tiebreak_used = True
+            else:
+                selected_low_bin = nearest_low_bin
+                selection_reason = "ambiguous_default_low_bin"
+        else:
+            selected_low_bin = nearest_low_bin
+            selection_reason = "ambiguous_default_low_bin"
+
+    de_3 = float(normalized_de[3])
+    de_10 = float(normalized_de[10])
+    de_30 = float(normalized_de[30])
+    frac_30 = float(fractions.get("30", 0.0))
+    clear_30_evidence = bool(
+        de_30 + MICRO_LOW_30_ADVANTAGE_REQUIRED < min(de_3, de_10)
+        or frac_30 >= MICRO_LOW_30_PIXEL_FRACTION_MIN
+    )
+    parsed_creatinine = _valid_positive_float(creatinine_mg_dl) if "_valid_positive_float" in globals() else None
+    low_30_uacr_boundary_risk = bool(
+        parsed_creatinine is not None
+        and (100.0 * 30.0 / parsed_creatinine) >= 30.0
+    )
+
+    if int(selected_low_bin) == 30 and not margin_is_clear and not clear_30_evidence:
+        fallback_low_bin = 3.0 if de_3 + MICRO_LOW_3_CLEAR_ADVANTAGE_OVER_10 < de_10 else float(MICRO_LOW_AMBIGUOUS_DEFAULT_BIN)
+        if (
+            MICRO_LOW_30_REQUIRE_CLEAR_EVIDENCE_WHEN_UACR_BOUNDARY
+            and low_30_uacr_boundary_risk
+        ):
+            selected_low_bin = fallback_low_bin
+            selection_reason = "ambiguous_30_downgraded_due_to_uacr_boundary_risk"
+        else:
+            selected_low_bin = fallback_low_bin
+            selection_reason = "ambiguous_30_downgraded_without_clear_30_evidence"
+    elif not margin_is_clear and not support_tiebreak_used:
+        if nearest_low_bin == 3 and de_3 + MICRO_LOW_3_CLEAR_ADVANTAGE_OVER_10 < de_10:
+            selected_low_bin = 3
+        else:
+            selected_low_bin = float(MICRO_LOW_AMBIGUOUS_DEFAULT_BIN)
+        selection_reason = "ambiguous_default_low_bin"
+
+    return {
+        "selected_low_bin": float(selected_low_bin),
+        "nearest_low_bin": int(nearest_low_bin),
+        "nearest_low_de": float(nearest_low_de),
+        "second_low_bin": int(second_low_bin),
+        "second_low_de": float(second_low_de),
+        "low_bin_margin": float(low_bin_margin),
+        "low_pixel_fraction_by_class": fractions,
+        "clear_30_evidence": bool(clear_30_evidence),
+        "low_30_uacr_boundary_risk": bool(low_30_uacr_boundary_risk),
+        "branch_name": None if branch_name is None else str(branch_name),
+        "selection_reason": str(selection_reason),
+    }
+
+
 def microalbumin_guard_from_evidence(
     *,
     current_value_float,
@@ -437,6 +573,9 @@ def microalbumin_guard_from_evidence(
     very_low_moderate_aqua=False,
     moderate_aqua_present=False,
     allow_unconfirmed=True,
+    median_de_low_by_class=None,
+    low_pixel_fraction_by_class=None,
+    creatinine_mg_dl=None,
 ):
     """Small decision slice used by tests and by the V4 shade guard aqua-tier branches."""
     current_value_float = float(current_value_float)
@@ -446,6 +585,30 @@ def microalbumin_guard_from_evidence(
     action = "unchanged_not_evaluated"
     guard_reason = ""
     provisional_albumin_range_mg_l = None
+    low_bin_selection = None
+
+    def _select_low_bin_for_branch(branch_name):
+        if median_de_low_by_class is None:
+            return {
+                "selected_low_bin": float(low_candidate_class_mg_l),
+                "nearest_low_bin": int(low_candidate_class_mg_l),
+                "nearest_low_de": 0.0,
+                "second_low_bin": int(low_candidate_class_mg_l),
+                "second_low_de": 0.0,
+                "low_bin_margin": 0.0,
+                "low_pixel_fraction_by_class": _jsonable_low_bin_fraction_map(low_pixel_fraction_by_class),
+                "clear_30_evidence": bool(low_candidate_class_mg_l == 30),
+                "low_30_uacr_boundary_risk": False,
+                "branch_name": str(branch_name),
+                "selection_reason": "fallback_nearest_low_bin",
+            }
+        return select_low_albumin_bin_3_10_30(
+            median_de_low_by_class=median_de_low_by_class,
+            low_pixel_fraction_by_class=low_pixel_fraction_by_class,
+            creatinine_mg_dl=creatinine_mg_dl,
+            branch_name=branch_name,
+        )
+
     if current_value_float < MICRO_HIGH_VERIFY_MIN_VALUE:
         if overbright_ood_no_chart_support:
             corrected_albumin_value = None
@@ -454,25 +617,29 @@ def microalbumin_guard_from_evidence(
             action = "unconfirmed_ood_below_400"
             guard_reason = "Microalbumin estimate is below 400 mg/L, but pod colour evidence is out-of-distribution; retake required."
         elif low_shade_confirmed:
-            corrected_albumin_value = float(low_candidate_class_mg_l)
+            low_bin_selection = _select_low_bin_for_branch("confirmed_low_exact_3_10_30")
+            corrected_albumin_value = low_bin_selection["selected_low_bin"]
             report_mode = "exact"
             guard_applied = current_value_float != corrected_albumin_value
             action = "confirmed_low_exact_3_10_30"
             guard_reason = "Strict low-shade evidence confirmed; exact 3/10/30 mg/L selected."
         elif (low_shade_confirmed_relaxed or low_shade_confirmed) and weak_aqua_low_compatible and not strong_aqua_confirmed and not moderate_aqua_present:
-            corrected_albumin_value = float(low_candidate_class_mg_l)
+            low_bin_selection = _select_low_bin_for_branch("weak_aqua_low_compatible_mapped_to_low")
+            corrected_albumin_value = low_bin_selection["selected_low_bin"]
             guard_applied = current_value_float != corrected_albumin_value
             report_mode = "guarded_exact"
             action = "weak_aqua_low_compatible_mapped_to_low"
             guard_reason = "Faint weak-aqua evidence was present, but low-shade evidence supported a <30 mg/L class; microalbumin was mapped to the nearest low class 3/10/30 mg/L."
         elif (low_shade_confirmed_relaxed or low_shade_confirmed) and very_low_moderate_aqua and not strong_aqua_confirmed and not moderate_aqua_present:
-            corrected_albumin_value = float(low_candidate_class_mg_l)
+            low_bin_selection = _select_low_bin_for_branch("very_low_moderate_aqua_with_low_evidence_mapped_to_low")
+            corrected_albumin_value = low_bin_selection["selected_low_bin"]
             guard_applied = current_value_float != corrected_albumin_value
             report_mode = "guarded_exact"
             action = "very_low_moderate_aqua_with_low_evidence_mapped_to_low"
             guard_reason = "Very-low moderate aqua evidence was present, but low-shade evidence remained competitive; microalbumin was mapped to the nearest low class 3/10/30 mg/L."
         elif low_shade_confirmed_relaxed and not strong_aqua_confirmed:
-            corrected_albumin_value = float(low_candidate_class_mg_l)
+            low_bin_selection = _select_low_bin_for_branch("relaxed_low_guard_below_400")
+            corrected_albumin_value = low_bin_selection["selected_low_bin"]
             report_mode = "guarded_exact"
             guard_applied = current_value_float != corrected_albumin_value
             action = "relaxed_low_guard_below_400"
@@ -516,6 +683,12 @@ def microalbumin_guard_from_evidence(
         "provisional_albumin_range_mg_l": provisional_albumin_range_mg_l,
         "action": action,
         "guard_reason": guard_reason,
+        "low_bin_selection": low_bin_selection,
+        "selected_low_bin": None if low_bin_selection is None else low_bin_selection.get("selected_low_bin"),
+        "low_bin_margin": None if low_bin_selection is None else low_bin_selection.get("low_bin_margin"),
+        "low_bin_selection_reason": None if low_bin_selection is None else low_bin_selection.get("selection_reason"),
+        "low_30_clear_evidence": None if low_bin_selection is None else low_bin_selection.get("clear_30_evidence"),
+        "low_30_uacr_boundary_risk": None if low_bin_selection is None else low_bin_selection.get("low_30_uacr_boundary_risk"),
     }
 
 def microalbumin_shade_sanity_check(
@@ -525,6 +698,7 @@ def microalbumin_shade_sanity_check(
     current_albumin_label=None,
     current_confidence=None,
     allow_unconfirmed=True,
+    creatinine_mg_dl=None,
 ):
     """Targeted post-hoc visual guard for microalbumin only."""
     def _normalize_confidence(conf):
@@ -548,6 +722,14 @@ def microalbumin_shade_sanity_check(
         if provisional_range is not None:
             provisional_range = (float(provisional_range[0]), float(provisional_range[1]))
         strong_bin = kwargs.get("strong_aqua_candidate_bin")
+        median_de_low = kwargs.get("median_de_low_by_class", {}) or {}
+        low_pixel_fractions = kwargs.get("low_pixel_fraction_by_class", {}) or {}
+        low_bin_selection = kwargs.get("low_bin_selection")
+        valid_creatinine = _valid_positive_float(creatinine_mg_dl) if "_valid_positive_float" in globals() else None
+        uacr_if_low = {
+            bin_value: (None if valid_creatinine is None else float(100.0 * float(bin_value) / valid_creatinine))
+            for bin_value in (3, 10, 30)
+        }
         return {
             "guard_name": "microalbumin_shade_sanity_check",
             "guard_applied": bool(kwargs.get("guard_applied", False)),
@@ -561,13 +743,23 @@ def microalbumin_shade_sanity_check(
             "low_candidate_rgb": tuple(int(round(x)) for x in low_rgb),
             "low_candidate_hex": "#%02X%02X%02X" % tuple(int(round(x)) for x in low_rgb),
             "low_candidate_visual_name": MICROALBUMIN_LOW_EXACT_VISUAL_NAMES.get(low_cls, "nearest low microalbumin shade"),
-            "median_de_low_by_class": {int(k): float(v) for k, v in kwargs.get("median_de_low_by_class", {}).items()},
-            "median_de_3": float(kwargs.get("median_de_low_by_class", {}).get(3, 0.0)),
-            "median_de_10": float(kwargs.get("median_de_low_by_class", {}).get(10, 0.0)),
-            "median_de_30": float(kwargs.get("median_de_low_by_class", {}).get(30, 0.0)),
+            "median_de_low_by_class": {str(bin_value): float(_low_bin_value_from_mapping(median_de_low, bin_value, 0.0) or 0.0) for bin_value in (3, 10, 30)},
+            "median_de_3": float(_low_bin_value_from_mapping(median_de_low, 3, 0.0) or 0.0),
+            "median_de_10": float(_low_bin_value_from_mapping(median_de_low, 10, 0.0) or 0.0),
+            "median_de_30": float(_low_bin_value_from_mapping(median_de_low, 30, 0.0) or 0.0),
             "median_low_de": float(kwargs.get("median_low_de", 0.0)),
             "low_margin": float(kwargs.get("low_margin", 0.0)),
             "low_pixel_fraction": float(kwargs.get("low_pixel_fraction", 0.0)),
+            "low_pixel_fraction_by_class": _jsonable_low_bin_fraction_map(low_pixel_fractions),
+            "low_bin_selection": low_bin_selection,
+            "selected_low_bin": _safe_float(kwargs.get("selected_low_bin")),
+            "low_bin_margin": _safe_float(kwargs.get("low_bin_margin")),
+            "low_30_clear_evidence": None if kwargs.get("low_30_clear_evidence") is None else bool(kwargs.get("low_30_clear_evidence")),
+            "low_30_uacr_boundary_risk": None if kwargs.get("low_30_uacr_boundary_risk") is None else bool(kwargs.get("low_30_uacr_boundary_risk")),
+            "low_bin_selection_reason": None if kwargs.get("low_bin_selection_reason") is None else str(kwargs.get("low_bin_selection_reason")),
+            "uacr_if_low_3": uacr_if_low[3],
+            "uacr_if_low_10": uacr_if_low[10],
+            "uacr_if_low_30": uacr_if_low[30],
             "low_shade_confirmed": bool(kwargs.get("low_shade_confirmed", False)),
             "low_shade_confirmed_relaxed": bool(kwargs.get("low_shade_confirmed_relaxed", False)),
             "low_ambiguous": bool(kwargs.get("low_ambiguous", False)),
@@ -637,6 +829,13 @@ def microalbumin_shade_sanity_check(
         "provisional_albumin_range_mg_l": None,
         "low_candidate_class_mg_l": 10,
         "median_de_low_by_class": {3: 0.0, 10: 0.0, 30: 0.0},
+        "low_pixel_fraction_by_class": {3: 0.0, 10: 0.0, 30: 0.0},
+        "low_bin_selection": None,
+        "selected_low_bin": None,
+        "low_bin_margin": None,
+        "low_30_clear_evidence": None,
+        "low_30_uacr_boundary_risk": None,
+        "low_bin_selection_reason": None,
         "median_low_de": 0.0,
         "low_margin": 0.0,
         "low_pixel_fraction": 0.0,
@@ -722,6 +921,10 @@ def microalbumin_shade_sanity_check(
     low_margin = float(second_low_de - median_low_de)
     low_pixel_de = np.minimum.reduce([de_low_by_class[3], de_low_by_class[10], de_low_by_class[30]])
     low_pixel_fraction = float(np.mean(low_pixel_de <= MICRO_LOW_DE_MAX))
+    low_pixel_fraction_by_class = {
+        cls: float(np.mean(de_vals <= MICRO_LOW_DE_MAX))
+        for cls, de_vals in de_low_by_class.items()
+    }
     low_shade_confirmed = bool(
         median_low_de <= MICRO_LOW_DE_MAX
         and low_pixel_fraction >= MICRO_LOW_PIXEL_FRACTION_MIN
@@ -845,6 +1048,7 @@ def microalbumin_shade_sanity_check(
     base.update({
         "low_candidate_class_mg_l": low_candidate_class_mg_l,
         "median_de_low_by_class": median_de_low_by_class,
+        "low_pixel_fraction_by_class": low_pixel_fraction_by_class,
         "median_low_de": median_low_de,
         "low_margin": low_margin,
         "low_pixel_fraction": low_pixel_fraction,
@@ -882,6 +1086,15 @@ def microalbumin_shade_sanity_check(
     provisional_albumin_range_mg_l = None
     action = "unchanged_not_evaluated"
     guard_reason = ""
+    low_bin_selection = None
+
+    def _select_low_bin_for_branch(branch_name):
+        return select_low_albumin_bin_3_10_30(
+            median_de_low_by_class=median_de_low_by_class,
+            low_pixel_fraction_by_class=low_pixel_fraction_by_class,
+            creatinine_mg_dl=creatinine_mg_dl,
+            branch_name=branch_name,
+        )
 
     if current_value_float < MICRO_HIGH_VERIFY_MIN_VALUE:
         if overbright_ood_no_chart_support:
@@ -893,7 +1106,8 @@ def microalbumin_shade_sanity_check(
                 "Microalbumin estimate is below 400 mg/L, but pod colour evidence is out-of-distribution; retake required."
             )
         elif low_shade_confirmed:
-            corrected_albumin_value = float(low_candidate_class_mg_l)
+            low_bin_selection = _select_low_bin_for_branch("confirmed_low_exact_3_10_30")
+            corrected_albumin_value = low_bin_selection["selected_low_bin"]
             report_mode = "exact"
             guard_applied = current_value_float != corrected_albumin_value
             action = "confirmed_low_exact_3_10_30"
@@ -901,7 +1115,8 @@ def microalbumin_shade_sanity_check(
                 "Strict low-shade evidence confirmed; exact 3/10/30 mg/L selected."
             )
         elif (low_shade_confirmed_relaxed or low_shade_confirmed) and weak_aqua_low_compatible and not strong_aqua_confirmed and not moderate_aqua_present:
-            corrected_albumin_value = float(low_candidate_class_mg_l)
+            low_bin_selection = _select_low_bin_for_branch("weak_aqua_low_compatible_mapped_to_low")
+            corrected_albumin_value = low_bin_selection["selected_low_bin"]
             guard_applied = current_value_float != corrected_albumin_value
             report_mode = "guarded_exact"
             action = "weak_aqua_low_compatible_mapped_to_low"
@@ -910,7 +1125,8 @@ def microalbumin_shade_sanity_check(
                 "microalbumin was mapped to the nearest low class 3/10/30 mg/L."
             )
         elif (low_shade_confirmed_relaxed or low_shade_confirmed) and very_low_moderate_aqua and not strong_aqua_confirmed and not moderate_aqua_present:
-            corrected_albumin_value = float(low_candidate_class_mg_l)
+            low_bin_selection = _select_low_bin_for_branch("very_low_moderate_aqua_with_low_evidence_mapped_to_low")
+            corrected_albumin_value = low_bin_selection["selected_low_bin"]
             guard_applied = current_value_float != corrected_albumin_value
             report_mode = "guarded_exact"
             action = "very_low_moderate_aqua_with_low_evidence_mapped_to_low"
@@ -919,7 +1135,8 @@ def microalbumin_shade_sanity_check(
                 "microalbumin was mapped to the nearest low class 3/10/30 mg/L."
             )
         elif low_shade_confirmed_relaxed and not strong_aqua_confirmed:
-            corrected_albumin_value = float(low_candidate_class_mg_l)
+            low_bin_selection = _select_low_bin_for_branch("relaxed_low_guard_below_400")
+            corrected_albumin_value = low_bin_selection["selected_low_bin"]
             report_mode = "guarded_exact"
             guard_applied = current_value_float != corrected_albumin_value
             action = "relaxed_low_guard_below_400"
@@ -1008,6 +1225,12 @@ def microalbumin_shade_sanity_check(
         "action": action,
         "guard_reason": guard_reason,
         "confidence_bucket": confidence_bucket,
+        "low_bin_selection": low_bin_selection,
+        "selected_low_bin": None if low_bin_selection is None else low_bin_selection.get("selected_low_bin"),
+        "low_bin_margin": None if low_bin_selection is None else low_bin_selection.get("low_bin_margin"),
+        "low_30_clear_evidence": None if low_bin_selection is None else low_bin_selection.get("clear_30_evidence"),
+        "low_30_uacr_boundary_risk": None if low_bin_selection is None else low_bin_selection.get("low_30_uacr_boundary_risk"),
+        "low_bin_selection_reason": None if low_bin_selection is None else low_bin_selection.get("selection_reason"),
     })
 
     if report_mode in ("unconfirmed", "provisional_range") or guard_applied:
@@ -2185,6 +2408,7 @@ def process_image_and_get_pods(image_path, model, device):
         current_albumin_label=c2_low_end_label,
         current_confidence=pod2_conf.get('confidence'),
         allow_unconfirmed=True,
+        creatinine_mg_dl=c1_snapped,
     )
     albumin_guarded_scenario = derive_microalbumin_guarded_uacr_scenario(
         shade_guard=albumin_shade_guard,
