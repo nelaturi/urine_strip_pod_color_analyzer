@@ -131,3 +131,45 @@ def test_unconfirmed_albumin_acr_si_display():
     acr_si = utils.calculate_acr_si(None, 150)
     assert acr_si["acr_si_display"] == "Unconfirmed / retest"
     assert acr_si["acr_si_stage_code"] == "unconfirmed"
+
+
+# --- A1/A2 boundary is inclusive at the A1 side: UACR == 30 -> A1, ACR == 3 -> A1 ---
+
+def test_uacr_exactly_30_is_a1():
+    staged = utils.stage_uacr_value(30.0)
+    assert staged["uacr_stage_code"] == "A1"
+    _, stage, _, _ = utils.calculate_uacr_and_category(30.0, 100.0)  # UACR = 30.0
+    assert stage == "A1 Proteinuria"
+
+
+def test_uacr_just_above_30_is_a2():
+    staged = utils.stage_uacr_value(30.01)
+    assert staged["uacr_stage_code"] == "A2"
+
+
+def test_uacr_exactly_300_is_a2():
+    staged = utils.stage_uacr_value(300.0)
+    assert staged["uacr_stage_code"] == "A2"
+    staged_above = utils.stage_uacr_value(300.01)
+    assert staged_above["uacr_stage_code"] == "A3"
+
+
+def test_acr_si_exactly_3_is_a1():
+    staged = utils.stage_acr_si_mg_mmol(3.0)
+    assert staged["acr_si_stage_code"] == "A1"
+    staged_above = utils.stage_acr_si_mg_mmol(3.01)
+    assert staged_above["acr_si_stage_code"] == "A2"
+
+
+def test_uacr_range_high_exactly_30_is_provisional_a1():
+    # band low/high both land at UACR <= 30 -> A1_provisional. creat=100, albumin 10..30 -> UACR 10..30.
+    result = utils.calculate_uacr_range_and_stage((10.0, 30.0), 100.0)
+    assert result["uacr_stage_code"] == "A1_provisional"
+
+
+def test_acr_si_range_high_exactly_3_is_provisional_a1():
+    # creat such that ACR_high == 3.0 exactly. ACR = albumin / (cr * 0.0884).
+    # albumin_high / (cr*0.0884) = 3 -> with cr=100, cr*0.0884=8.84 -> albumin_high=26.52.
+    result = utils.calculate_acr_si_range((8.84, 26.52), 100.0)
+    assert result["acr_si_range_mg_mmol"][1] == pytest.approx(3.0, abs=0.01)
+    assert result["acr_si_stage_code"] == "A1_provisional"

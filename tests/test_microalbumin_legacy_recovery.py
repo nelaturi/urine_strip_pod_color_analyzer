@@ -214,6 +214,8 @@ def test_display_mode_uses_legacy_recovered_not_exact(monkeypatch):
 
 def test_uacr_staging():
     assert utils.stage_uacr_value(29.99)["uacr_stage_code"] == "A1"
-    assert utils.stage_uacr_value(30)["uacr_stage_code"] == "A2"
+    # A1/A2 boundary is inclusive at the A1 side: UACR == 30 -> A1.
+    assert utils.stage_uacr_value(30)["uacr_stage_code"] == "A1"
+    assert utils.stage_uacr_value(30.01)["uacr_stage_code"] == "A2"
     assert utils.stage_uacr_value(300)["uacr_stage_code"] == "A2"
     assert utils.stage_uacr_value(300.01)["uacr_stage_code"] == "A3"

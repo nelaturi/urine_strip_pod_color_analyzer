@@ -51,6 +51,12 @@ MICRO_LOW_30_PIXEL_FRACTION_MIN = 0.18
 MICRO_LOW_AMBIGUOUS_DEFAULT_BIN = 10.0
 MICRO_LOW_3_CLEAR_ADVANTAGE_OVER_10 = 0.50
 MICRO_LOW_30_REQUIRE_CLEAR_EVIDENCE_WHEN_UACR_BOUNDARY = True
+# Boundary-sensitive 30 mg/L confirmation thresholds (A1/A2 boundary risk only).
+# 30 is kept on the boundary only with a clear color advantage and pixel dominance,
+# or a strong color advantage on its own.
+MICRO_LOW_30_BOUNDARY_DE_ADVANTAGE_MIN = 2.0
+MICRO_LOW_30_BOUNDARY_DOMINANCE_MIN = 0.10
+MICRO_LOW_30_BOUNDARY_DE_ADVANTAGE_STRONG = 3.0
 
 # Below-400 balanced guard
 MICRO_LOW_DE_RELAXED_MAX = 11.5
@@ -522,27 +528,69 @@ def select_low_albumin_bin_3_10_30(
     de_3 = float(normalized_de[3])
     de_10 = float(normalized_de[10])
     de_30 = float(normalized_de[30])
+    frac_3 = float(normalized_support.get(3, 0.0))
+    frac_10 = float(normalized_support.get(10, 0.0))
     frac_30 = float(normalized_support.get(30, 0.0))
-    clear_30_evidence = bool(
+
+    # Base (legacy) 30 acceptance: ΔE win OR pixel-fraction support.
+    base_clear_30_evidence = bool(
         de_30 + MICRO_LOW_30_ADVANTAGE_REQUIRED < min(de_3, de_10)
         or frac_30 >= MICRO_LOW_30_PIXEL_FRACTION_MIN
     )
+
+    # Boundary-sensitive 30 confirmation: how much better 30 fits by color
+    # (advantage) and how much more pixel support 30 has (dominance) vs the
+    # smaller low bins. Used only on the A1/A2 boundary-risk path below.
+    low_30_de_advantage = float(min(de_3, de_10) - de_30)
+    low_30_support_dominance = float(frac_30 - max(frac_3, frac_10))
+    boundary_sensitive_30_evidence = bool(
+        (
+            low_30_de_advantage >= MICRO_LOW_30_BOUNDARY_DE_ADVANTAGE_MIN
+            and low_30_support_dominance >= MICRO_LOW_30_BOUNDARY_DOMINANCE_MIN
+        )
+        or low_30_de_advantage >= MICRO_LOW_30_BOUNDARY_DE_ADVANTAGE_STRONG
+    )
+
     valid_creatinine = _valid_positive_float(creatinine_mg_dl)
     low_30_uacr_boundary_risk = bool(
         valid_creatinine is not None
         and (100.0 * 30.0 / valid_creatinine) >= 30.0
     )
 
-    if selected_low_bin == 30 and not clear_30_evidence:
-        downgraded_bin = 3 if de_3 + MICRO_LOW_3_CLEAR_ADVANTAGE_OVER_10 < de_10 else int(MICRO_LOW_AMBIGUOUS_DEFAULT_BIN)
+    # Public evidence field keeps its legacy meaning off the boundary; on the
+    # boundary-risk path it reflects the stricter confirmation actually used.
+    clear_30_evidence = base_clear_30_evidence
+
+    if selected_low_bin == 30:
         if (
             MICRO_LOW_30_REQUIRE_CLEAR_EVIDENCE_WHEN_UACR_BOUNDARY
             and low_30_uacr_boundary_risk
         ):
-            selected_low_bin = downgraded_bin
-            selection_reason = "ambiguous_30_downgraded_due_to_uacr_boundary_risk"
-        elif ambiguous_low_bins:
-            selected_low_bin = downgraded_bin
+            # On the A1/A2 boundary, ignore the permissive base evidence and
+            # require the stricter boundary-sensitive confirmation for 30.
+            clear_30_evidence = boundary_sensitive_30_evidence
+            if not boundary_sensitive_30_evidence:
+                # Downgrade only within the low family (3 or 10).
+                uacr_at_10 = (
+                    (100.0 * 10.0 / valid_creatinine)
+                    if valid_creatinine is not None
+                    else None
+                )
+                if uacr_at_10 is not None and uacr_at_10 >= 30.0:
+                    # Even 10 mg/L would still be A2; downgrade straight to 3.
+                    selected_low_bin = 3
+                elif de_3 + MICRO_LOW_3_CLEAR_ADVANTAGE_OVER_10 < de_10:
+                    selected_low_bin = 3
+                else:
+                    selected_low_bin = 10
+                selection_reason = "ambiguous_30_downgraded_due_to_uacr_boundary_risk"
+        elif not base_clear_30_evidence and ambiguous_low_bins:
+            # Non-boundary path: unchanged from prior behavior.
+            selected_low_bin = (
+                3
+                if de_3 + MICRO_LOW_3_CLEAR_ADVANTAGE_OVER_10 < de_10
+                else int(MICRO_LOW_AMBIGUOUS_DEFAULT_BIN)
+            )
             selection_reason = "ambiguous_30_downgraded_without_clear_30_evidence"
 
     return {
@@ -554,6 +602,10 @@ def select_low_albumin_bin_3_10_30(
         "low_bin_margin": float(low_bin_margin),
         "low_pixel_fraction_by_class": {str(bin_value): float(normalized_support[bin_value]) for bin_value in allowed_bins},
         "clear_30_evidence": bool(clear_30_evidence),
+        "base_clear_30_evidence": bool(base_clear_30_evidence),
+        "boundary_sensitive_30_evidence": bool(boundary_sensitive_30_evidence),
+        "low_30_de_advantage": float(low_30_de_advantage),
+        "low_30_support_dominance": float(low_30_support_dominance),
         "low_30_uacr_boundary_risk": bool(low_30_uacr_boundary_risk),
         "branch_name": None if branch_name is None else str(branch_name),
         "selection_reason": str(selection_reason),
@@ -1298,11 +1350,11 @@ def stage_acr_si_mg_mmol(acr_mg_mmol):
             "acr_si_stage_code": "unconfirmed",
             "acr_si_reference_range": None,
         }
-    if acr < 3:
+    if acr <= 3:
         return {
             "acr_si_stage": "A1: Normal to mildly increased",
             "acr_si_stage_code": "A1",
-            "acr_si_reference_range": "< 3 mg/mmol",
+            "acr_si_reference_range": "<= 3 mg/mmol",
         }
     if acr <= 30:
         return {
@@ -1348,13 +1400,13 @@ def calculate_acr_si_range(albumin_range_mg_l, creatinine_mg_dl):
     acr_high = high_albumin / (cr * 0.0884)
     low = round(acr_low, 2)
     high = round(acr_high, 2)
-    if acr_high < 3:
+    if acr_high <= 3:
         stage = "Provisional A1 / retest"
         code = "A1_provisional"
-    elif acr_low >= 3 and acr_high <= 30:
+    elif acr_low > 3 and acr_high <= 30:
         stage = "Provisional A2 / retest"
         code = "A2_provisional"
-    elif acr_low < 3 and acr_high <= 30:
+    elif acr_low <= 3 and acr_high <= 30:
         stage = "Provisional A1/A2 boundary / retest"
         code = "A1_A2_boundary_provisional"
     elif acr_low <= 30 and acr_high > 30:
@@ -1382,13 +1434,13 @@ def calculate_uacr_range_and_stage(albumin_range_mg_l, creatinine_mg_dl):
     uacr_low = 100.0 * float(low_albumin) / float(creatinine_mg_dl)
     uacr_high = 100.0 * float(high_albumin) / float(creatinine_mg_dl)
 
-    if uacr_high < 30:
+    if uacr_high <= 30:
         stage = "Provisional A1 / retest"
         code = "A1_provisional"
-    elif uacr_low >= 30 and uacr_high <= 300:
+    elif uacr_low > 30 and uacr_high <= 300:
         stage = "Provisional A2 / retest"
         code = "A2_provisional"
-    elif uacr_low < 30 and uacr_high <= 300:
+    elif uacr_low <= 30 and uacr_high <= 300:
         stage = "Provisional A1/A2 boundary / retest"
         code = "A1_A2_boundary_provisional"
     elif uacr_low <= 300 and uacr_high > 300:
@@ -1996,7 +2048,7 @@ def _select_higher_legacy_uacr(uacr_v2, uacr_v3, uacr_recovered):
 def stage_uacr_value(uacr_mg_g):
     if uacr_mg_g is None:
         return {"uacr_stage": "Unconfirmed", "uacr_stage_code": "unconfirmed"}
-    if uacr_mg_g < 30:
+    if uacr_mg_g <= 30:
         return {"uacr_stage": "A1 / normal to mildly increased", "uacr_stage_code": "A1"}
     if uacr_mg_g <= 300:
         return {"uacr_stage": "A2 / moderately increased", "uacr_stage_code": "A2"}
@@ -2320,10 +2372,10 @@ def calculate_uacr_and_category(albumin_mg_l, creatinine_mg_dl):
     uacr = 100.0 * albumin_mg_l / creatinine_mg_dl
     uacr_rounded = round(uacr, 2)
 
-    if uacr < 30:
+    if uacr <= 30:
         stage = "A1 Proteinuria"
-        reference_range = "< 30 mg/G"
-    elif 30 <= uacr <= 300:
+        reference_range = "<= 30 mg/G"
+    elif 30 < uacr <= 300:
         stage = "A2 Proteinuria"
         reference_range = "30 - 300 mg/G"
     else:

@@ -12,6 +12,12 @@ __pycache__/
 *.swp 
 .idea/ 
 .vscode/ 
+outputs/
+images_results/
+fastapi_sample.json
+*.zip
+*.pkl
+.claude/
 
 # Generated export artifacts
 exports/*

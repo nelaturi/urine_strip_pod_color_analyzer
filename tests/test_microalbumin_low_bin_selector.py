@@ -131,9 +131,17 @@ def test_clear_30_mg_l_selection():
     )
     assert out["selected_low_bin"] == 30.0
     assert out["clear_30_evidence"] is True
+    # Diagnostic fields present and well-formed.
+    assert out["base_clear_30_evidence"] is True
+    assert isinstance(out["low_30_de_advantage"], float)
+    assert isinstance(out["low_30_support_dominance"], float)
+    assert isinstance(out["boundary_sensitive_30_evidence"], bool)
 
 
 def test_ambiguous_30_downgraded_to_10_due_to_uacr_boundary_risk():
+    # Boundary risk (creat=80 -> UACR@30=37.5). Weak 30 evidence:
+    # Adv30 = 5.2-5.0 = 0.2, Dom30 = 0.11-0.10 = 0.01 -> fails confirmation.
+    # UACR@10 = 12.5 (<30, A1) and 3 not clearly better than 10 -> select 10.
     out = select(
         {3: 5.4, 10: 5.2, 30: 5.0},
         {3: 0.09, 10: 0.10, 30: 0.11},
@@ -141,17 +149,48 @@ def test_ambiguous_30_downgraded_to_10_due_to_uacr_boundary_risk():
     )
     assert out["selected_low_bin"] == 10.0
     assert out["low_30_uacr_boundary_risk"] is True
+    assert out["boundary_sensitive_30_evidence"] is False
     assert out["selection_reason"] == "ambiguous_30_downgraded_due_to_uacr_boundary_risk"
 
 
-def test_ambiguous_30_allowed_when_clear_30_support():
+def test_boundary_risk_weak_30_downgrades_to_3_when_10_still_a2():
+    # creat=20 -> UACR@10 = 50 (>=30, still A2) -> downgrade straight to 3.
     out = select(
-        {3: 6.0, 10: 5.8, 30: 5.2},
-        {3: 0.05, 10: 0.06, 30: 0.22},
+        {3: 5.4, 10: 5.2, 30: 5.0},
+        {3: 0.09, 10: 0.10, 30: 0.11},
+        creatinine=20,
+    )
+    assert out["selected_low_bin"] == 3.0
+    assert out["low_30_uacr_boundary_risk"] is True
+    assert out["boundary_sensitive_30_evidence"] is False
+    assert out["selection_reason"] == "ambiguous_30_downgraded_due_to_uacr_boundary_risk"
+
+
+def test_boundary_risk_strong_30_evidence_keeps_30():
+    # Boundary risk (creat=80). Strong color advantage:
+    # Adv30 = min(8,7)-4 = 3.0 (>=3.0) -> confirmation passes -> keep 30.
+    out = select(
+        {3: 8.0, 10: 7.0, 30: 4.0},
+        {3: 0.01, 10: 0.02, 30: 0.20},
         creatinine=80,
     )
     assert out["selected_low_bin"] == 30.0
+    assert out["low_30_uacr_boundary_risk"] is True
+    assert out["boundary_sensitive_30_evidence"] is True
     assert out["clear_30_evidence"] is True
+
+
+def test_non_boundary_risk_30_support_keeps_30():
+    # No creatinine -> no boundary risk -> legacy pixel-support path keeps 30
+    # even though boundary-sensitive confirmation would fail.
+    out = select(
+        {3: 6.0, 10: 5.8, 30: 5.2},
+        {3: 0.05, 10: 0.06, 30: 0.22},
+    )
+    assert out["selected_low_bin"] == 30.0
+    assert out["low_30_uacr_boundary_risk"] is False
+    assert out["base_clear_30_evidence"] is True
+    assert out["boundary_sensitive_30_evidence"] is False
 
 
 def test_ambiguous_low_defaults_to_10():
