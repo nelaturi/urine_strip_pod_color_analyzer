@@ -522,26 +522,49 @@ def select_low_albumin_bin_3_10_30(
     de_3 = float(normalized_de[3])
     de_10 = float(normalized_de[10])
     de_30 = float(normalized_de[30])
+    frac_3 = float(normalized_support.get(3, 0.0))
+    frac_10 = float(normalized_support.get(10, 0.0))
     frac_30 = float(normalized_support.get(30, 0.0))
-    clear_30_evidence = bool(
+    low_30_de_advantage = float(min(de_3, de_10) - de_30)
+    low_30_support_dominance = float(frac_30 - max(frac_3, frac_10))
+    base_clear_30_evidence = bool(
         de_30 + MICRO_LOW_30_ADVANTAGE_REQUIRED < min(de_3, de_10)
         or frac_30 >= MICRO_LOW_30_PIXEL_FRACTION_MIN
+    )
+    boundary_sensitive_30_evidence = bool(
+        (low_30_de_advantage >= 2.0 and low_30_support_dominance >= 0.10)
+        or low_30_de_advantage >= 3.0
     )
     valid_creatinine = _valid_positive_float(creatinine_mg_dl)
     low_30_uacr_boundary_risk = bool(
         valid_creatinine is not None
         and (100.0 * 30.0 / valid_creatinine) >= 30.0
     )
+    clear_30_evidence = bool(
+        base_clear_30_evidence
+        and (not low_30_uacr_boundary_risk or boundary_sensitive_30_evidence)
+    )
 
-    if selected_low_bin == 30 and not clear_30_evidence:
-        downgraded_bin = 3 if de_3 + MICRO_LOW_3_CLEAR_ADVANTAGE_OVER_10 < de_10 else int(MICRO_LOW_AMBIGUOUS_DEFAULT_BIN)
+    def _downgraded_low_family_bin():
+        if (
+            valid_creatinine is not None
+            and (100.0 * 10.0 / valid_creatinine) >= 30.0
+        ):
+            return 3
+        if de_3 + MICRO_LOW_3_CLEAR_ADVANTAGE_OVER_10 < de_10:
+            return 3
+        return int(MICRO_LOW_AMBIGUOUS_DEFAULT_BIN)
+
+    if selected_low_bin == 30:
+        downgraded_bin = _downgraded_low_family_bin()
         if (
             MICRO_LOW_30_REQUIRE_CLEAR_EVIDENCE_WHEN_UACR_BOUNDARY
             and low_30_uacr_boundary_risk
+            and not boundary_sensitive_30_evidence
         ):
             selected_low_bin = downgraded_bin
             selection_reason = "ambiguous_30_downgraded_due_to_uacr_boundary_risk"
-        elif ambiguous_low_bins:
+        elif not clear_30_evidence and ambiguous_low_bins:
             selected_low_bin = downgraded_bin
             selection_reason = "ambiguous_30_downgraded_without_clear_30_evidence"
 
@@ -554,6 +577,10 @@ def select_low_albumin_bin_3_10_30(
         "low_bin_margin": float(low_bin_margin),
         "low_pixel_fraction_by_class": {str(bin_value): float(normalized_support[bin_value]) for bin_value in allowed_bins},
         "clear_30_evidence": bool(clear_30_evidence),
+        "low_30_de_advantage": float(low_30_de_advantage),
+        "low_30_support_dominance": float(low_30_support_dominance),
+        "base_clear_30_evidence": bool(base_clear_30_evidence),
+        "boundary_sensitive_30_evidence": bool(boundary_sensitive_30_evidence),
         "low_30_uacr_boundary_risk": bool(low_30_uacr_boundary_risk),
         "branch_name": None if branch_name is None else str(branch_name),
         "selection_reason": str(selection_reason),

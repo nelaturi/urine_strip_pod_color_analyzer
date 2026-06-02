@@ -133,24 +133,57 @@ def test_clear_30_mg_l_selection():
     assert out["clear_30_evidence"] is True
 
 
-def test_ambiguous_30_downgraded_to_10_due_to_uacr_boundary_risk():
-    out = select(
-        {3: 5.4, 10: 5.2, 30: 5.0},
-        {3: 0.09, 10: 0.10, 30: 0.11},
-        creatinine=80,
-    )
-    assert out["selected_low_bin"] == 10.0
-    assert out["low_30_uacr_boundary_risk"] is True
-    assert out["selection_reason"] == "ambiguous_30_downgraded_due_to_uacr_boundary_risk"
-
-
-def test_ambiguous_30_allowed_when_clear_30_support():
+def test_boundary_risk_weak_30_evidence_downgrades_to_10():
     out = select(
         {3: 6.0, 10: 5.8, 30: 5.2},
         {3: 0.05, 10: 0.06, 30: 0.22},
         creatinine=80,
     )
+    assert out["selected_low_bin"] == 10.0
+    assert out["low_30_uacr_boundary_risk"] is True
+    assert out["base_clear_30_evidence"] is True
+    assert out["boundary_sensitive_30_evidence"] is False
+    assert out["clear_30_evidence"] is False
+    assert out["selection_reason"] == "ambiguous_30_downgraded_due_to_uacr_boundary_risk"
+
+
+def test_boundary_risk_weak_30_evidence_downgrades_to_3_when_10_uacr_is_still_a2():
+    out = select(
+        {3: 6.0, 10: 5.8, 30: 5.2},
+        {3: 0.05, 10: 0.06, 30: 0.22},
+        creatinine=30,
+    )
+    assert out["selected_low_bin"] == 3.0
+    assert out["low_30_uacr_boundary_risk"] is True
+    assert out["base_clear_30_evidence"] is True
+    assert out["boundary_sensitive_30_evidence"] is False
+    assert out["clear_30_evidence"] is False
+    assert out["selection_reason"] == "ambiguous_30_downgraded_due_to_uacr_boundary_risk"
+
+
+def test_strong_30_evidence_near_boundary_still_keeps_30():
+    out = select(
+        {3: 8.0, 10: 7.2, 30: 4.5},
+        {3: 0.05, 10: 0.08, 30: 0.19},
+        creatinine=80,
+    )
     assert out["selected_low_bin"] == 30.0
+    assert out["low_30_uacr_boundary_risk"] is True
+    assert out["low_30_de_advantage"] == 2.7
+    assert out["low_30_support_dominance"] == 0.11
+    assert out["boundary_sensitive_30_evidence"] is True
+
+
+def test_non_boundary_risk_30_support_case_remains_30():
+    out = select(
+        {3: 6.0, 10: 5.8, 30: 5.2},
+        {3: 0.05, 10: 0.06, 30: 0.22},
+        creatinine=200,
+    )
+    assert out["selected_low_bin"] == 30.0
+    assert out["low_30_uacr_boundary_risk"] is False
+    assert out["base_clear_30_evidence"] is True
+    assert out["boundary_sensitive_30_evidence"] is False
     assert out["clear_30_evidence"] is True
 
 
