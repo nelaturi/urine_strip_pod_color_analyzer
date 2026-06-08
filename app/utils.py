@@ -1,4 +1,7 @@
 import logging
+import json
+import re
+from datetime import datetime, timezone
 import matplotlib
 matplotlib.use('Agg') # MUST be before importing pyplot
 
@@ -29,6 +32,11 @@ except Exception:
 
 # Segmentation indices: Pod1=Creatinine, Pod2=Microalbumin
 POD1_IDX, POD2_IDX = 4, 5
+
+SEGMENTATION_ARTIFACTS_ENABLED = True
+SEGMENTATION_ARTIFACT_ROOT = 'outputs/segmentation_artifacts'
+SEGMENTATION_ARTIFACT_SCHEMA_VERSION = 'segmentation_artifacts_v1'
+
 
 # Distance/override thresholds (tune on validation)
 MICRO_DELTAE_ACCEPT = 8.0     # accept color centroid if best ΔE <= this
@@ -110,6 +118,12 @@ MICRO_VERY_HIGH_VALUE_MIN = MICRO_VERY_HIGH_GUARD_MIN
 MICRO_CHART_MEDIAN_DE_ACCEPT = MICRO_STRONG_AQUA_DE_MAX
 MICRO_MIN_CONFIDENCE_FOR_VERY_HIGH = MICRO_MIN_CONF_FOR_600
 MICRO_UNCONFIRMED_RETURNS_NONE = True
+MICRO_DISPLAY_EXACT_ABOVE_1400 = True
+MICRO_VERY_HIGH_DISPLAY_MIN = 1400.0
+MICRO_VERY_HIGH_DISPLAY_MODE = 'very_high_exact_value'
+MICRO_RANGE_EXACT_DE_MAX = 11.5
+MICRO_RANGE_EXACT_MARGIN_MIN = 1.0
+MICRO_RANGE_EXACT_PIXEL_SUPPORT_MIN = 0.18
 
 # Experimental legacy-recovery fallback for V4-unconfirmed microalbumin only.
 ENABLE_MICROALBUMIN_UNCONFIRMED_LEGACY_RECOVERY = True
@@ -177,6 +191,181 @@ def resource_path(relative_path):
     except AttributeError:
         base_path = os.path.abspath('.')
     return os.path.join(base_path, relative_path)
+
+
+def _safe_artifact_token(value, default="item"):
+    text = str(value or default)
+    text = os.path.basename(text)
+    text = os.path.splitext(text)[0] or default
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._") or default
+
+
+def _ensure_uint8_rgb(image_np):
+    arr = np.asarray(image_np)
+    if arr.ndim == 2:
+        arr = np.stack([arr] * 3, axis=-1)
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
+
+
+def _json_ready(value):
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return _json_ready(value.tolist())
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    return value
+
+
+def create_segmentation_artifact_dir(base_dir, request_id=None, image_name=None):
+    """Create a structured per-inference folder for segmentation artifacts."""
+    request_token = _safe_artifact_token(request_id or uuid.uuid4().hex, "request")
+    image_token = _safe_artifact_token(image_name or "image", "image")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    artifact_dir = os.path.join(base_dir, f"{timestamp}_{request_token}_{image_token}")
+    os.makedirs(artifact_dir, exist_ok=False)
+    return artifact_dir
+
+
+def _save_png(path, image_np):
+    Image.fromarray(_ensure_uint8_rgb(image_np)).save(path)
+
+
+def _save_mask_png(path, mask_np):
+    mask = np.asarray(mask_np)
+    if mask.dtype == bool:
+        out = mask.astype(np.uint8) * 255
+    else:
+        max_val = int(mask.max()) if mask.size else 0
+        scale = 255 // max(max_val, 1)
+        out = np.clip(mask.astype(np.uint16) * scale, 0, 255).astype(np.uint8)
+    Image.fromarray(out).save(path)
+
+
+def _overlay_mask_on_image(image_np, mask_np, color=(255, 0, 0), alpha=105):
+    base = Image.fromarray(_ensure_uint8_rgb(image_np)).convert("RGBA")
+    mask_bool = np.asarray(mask_np).astype(bool)
+    overlay = np.zeros((*mask_bool.shape, 4), dtype=np.uint8)
+    overlay[mask_bool] = [int(color[0]), int(color[1]), int(color[2]), int(alpha)]
+    return Image.alpha_composite(base, Image.fromarray(overlay, mode="RGBA")).convert("RGB")
+
+
+def _overlay_all_classes(image_np, mask_np, alpha=95):
+    base = Image.fromarray(_ensure_uint8_rgb(image_np)).convert("RGBA")
+    mask = np.asarray(mask_np)
+    palette = {
+        POD1_IDX: (255, 165, 0),
+        POD2_IDX: (0, 180, 255),
+    }
+    fallback = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+        (255, 0, 255), (0, 255, 255), (180, 80, 255), (255, 120, 120),
+    ]
+    overlay = np.zeros((*mask.shape, 4), dtype=np.uint8)
+    for cls in np.unique(mask):
+        cls_int = int(cls)
+        if cls_int == 0:
+            continue
+        color = palette.get(cls_int, fallback[cls_int % len(fallback)])
+        overlay[mask == cls_int] = [*color, int(alpha)]
+    return Image.alpha_composite(base, Image.fromarray(overlay, mode="RGBA")).convert("RGB")
+
+
+def save_segmentation_artifacts(
+    artifact_dir,
+    raw_image_np,
+    wb_image_np,
+    pred_mask_original_size,
+    pred_mask_model_size=None,
+    pod1_mask=None,
+    pod2_mask=None,
+    class_labels=None,
+    metadata=None,
+):
+    """Save segmentation masks and transparent pod overlays without mutating inference arrays."""
+    os.makedirs(artifact_dir, exist_ok=True)
+    raw = _ensure_uint8_rgb(raw_image_np)
+    mask_original = np.asarray(pred_mask_original_size).copy()
+    h, w = mask_original.shape[:2]
+    pod1 = np.asarray(pod1_mask if pod1_mask is not None else (mask_original == POD1_IDX)).astype(bool).copy()
+    pod2 = np.asarray(pod2_mask if pod2_mask is not None else (mask_original == POD2_IDX)).astype(bool).copy()
+
+    files = {
+        "raw_image": os.path.join(artifact_dir, "raw_image.png"),
+        "white_balanced_image": os.path.join(artifact_dir, "white_balanced_image.png"),
+        "segmentation_mask_npy": os.path.join(artifact_dir, "segmentation_mask_original.npy"),
+        "segmentation_mask_png": os.path.join(artifact_dir, "segmentation_mask_original.png"),
+        "segmentation_mask_model_size_npy": os.path.join(artifact_dir, "segmentation_mask_model_size.npy"),
+        "pod1_mask_npy": os.path.join(artifact_dir, "pod1_creatinine_mask.npy"),
+        "pod1_mask_png": os.path.join(artifact_dir, "pod1_creatinine_mask.png"),
+        "pod2_mask_npy": os.path.join(artifact_dir, "pod2_microalbumin_mask.npy"),
+        "pod2_mask_png": os.path.join(artifact_dir, "pod2_microalbumin_mask.png"),
+        "pod1_on_strip_png": os.path.join(artifact_dir, "pod1_creatinine_on_strip.png"),
+        "pod2_on_strip_png": os.path.join(artifact_dir, "pod2_microalbumin_on_strip.png"),
+        "overlay_all_classes_png": os.path.join(artifact_dir, "segmentation_overlay_all_classes.png"),
+        "metadata_json": os.path.join(artifact_dir, "metadata.json"),
+    }
+
+    _save_png(files["raw_image"], raw)
+    if wb_image_np is not None:
+        _save_png(files["white_balanced_image"], wb_image_np)
+    np.save(files["segmentation_mask_npy"], mask_original)
+    _save_mask_png(files["segmentation_mask_png"], mask_original)
+    if pred_mask_model_size is not None:
+        np.save(files["segmentation_mask_model_size_npy"], np.asarray(pred_mask_model_size).copy())
+    np.save(files["pod1_mask_npy"], pod1)
+    _save_mask_png(files["pod1_mask_png"], pod1)
+    np.save(files["pod2_mask_npy"], pod2)
+    _save_mask_png(files["pod2_mask_png"], pod2)
+    _overlay_mask_on_image(raw, pod1, color=(255, 165, 0)).save(files["pod1_on_strip_png"])
+    _overlay_mask_on_image(raw, pod2, color=(0, 180, 255)).save(files["pod2_on_strip_png"])
+    _overlay_all_classes(raw, mask_original).save(files["overlay_all_classes_png"])
+
+    pod1_area = int(pod1.sum())
+    pod2_area = int(pod2.sum())
+    image_area = float(max(h * w, 1))
+    supplied = dict(metadata or {})
+    artifact_files = {k: v for k, v in files.items() if os.path.exists(v) or k == "metadata_json"}
+    meta = {
+        "artifact_schema_version": SEGMENTATION_ARTIFACT_SCHEMA_VERSION,
+        "database_export_ready": True,
+        "request_id": str(supplied.get("request_id") or ""),
+        "image_name": str(supplied.get("image_name") or ""),
+        "timestamp": str(supplied.get("timestamp") or datetime.now(timezone.utc).isoformat()),
+        "model_path": str(supplied.get("model_path") or ""),
+        "model_input_size": list(supplied.get("model_input_size") or [256, 256]),
+        "original_image_size": [int(h), int(w)],
+        "segmentation_classes_present": [int(x) for x in np.unique(mask_original).tolist()],
+        "pod1_class_index": int(supplied.get("pod1_class_index", POD1_IDX)),
+        "pod2_class_index": int(supplied.get("pod2_class_index", POD2_IDX)),
+        "pod1_area_px": pod1_area,
+        "pod2_area_px": pod2_area,
+        "pod1_area_ratio": float(pod1_area / image_area),
+        "pod2_area_ratio": float(pod2_area / image_area),
+        "artifact_files": artifact_files,
+    }
+    if class_labels is not None:
+        meta["class_labels"] = _json_ready(class_labels)
+    for k, v in supplied.items():
+        if k not in meta:
+            meta[k] = _json_ready(v)
+    with open(files["metadata_json"], "w", encoding="utf-8") as fh:
+        json.dump(_json_ready(meta), fh, indent=2, sort_keys=True)
+    return {
+        "artifact_dir": artifact_dir,
+        "database_export_ready": True,
+        **meta,
+    }
 
 # ───────────────────────────────
 # Load Regression Models
@@ -1432,6 +1621,173 @@ def calculate_uacr_range_and_stage(albumin_range_mg_l, creatinine_mg_dl):
         "uacr_stage_code": code,
     }
 
+
+def _microalbumin_very_high_payload(albumin_value):
+    triggered = False
+    display_value = None
+    try:
+        if albumin_value is not None and float(albumin_value) > MICRO_VERY_HIGH_DISPLAY_MIN:
+            triggered = bool(MICRO_DISPLAY_EXACT_ABOVE_1400)
+            display_value = float(albumin_value)
+    except (TypeError, ValueError):
+        triggered = False
+    return {
+        "enabled": bool(MICRO_DISPLAY_EXACT_ABOVE_1400),
+        "threshold_mg_l": float(MICRO_VERY_HIGH_DISPLAY_MIN),
+        "triggered": triggered,
+        "display_value_mg_l": display_value if triggered else None,
+        "display_mode": MICRO_VERY_HIGH_DISPLAY_MODE if triggered else None,
+    }
+
+
+def explain_microalbumin_range_reason(shade_guard: dict) -> dict:
+    """Summarize why a provisional microalbumin range can or cannot be exact."""
+    shade_guard = shade_guard or {}
+    range_tuple = shade_guard.get("provisional_albumin_range_mg_l")
+    report_mode = shade_guard.get("report_mode")
+    action = shade_guard.get("action")
+    out = {
+        "has_provisional_range": range_tuple is not None,
+        "report_mode": report_mode,
+        "action": action,
+        "nearest_chart_bin": shade_guard.get("nearest_chart_bin"),
+        "nearest_chart_de": shade_guard.get("nearest_chart_de"),
+        "second_nearest_chart_de": shade_guard.get("second_nearest_chart_de"),
+        "nearest_vs_second_margin": shade_guard.get("nearest_vs_second_margin"),
+        "reason": "No provisional range is present.",
+    }
+    if report_mode == "unconfirmed" or str(action).startswith("unconfirmed") or shade_guard.get("overbright_ood_no_chart_support"):
+        out["reason"] = "Unconfirmed/OOD microalbumin evidence is not eligible for range-to-exact resolution."
+    elif range_tuple is not None:
+        out["reason"] = "Provisional range requires strong nearest-chart-bin evidence before exact reporting."
+    return out
+
+
+def _mapping_value(mapping, key):
+    if not isinstance(mapping, dict):
+        return None
+    for candidate in (key, int(key) if float(key).is_integer() else key, float(key), str(int(key)) if float(key).is_integer() else str(key), str(key)):
+        if candidate in mapping:
+            try:
+                return float(mapping[candidate])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def resolve_microalbumin_range_to_exact_if_supported(
+    shade_guard: dict,
+    median_de_by_bin: dict = None,
+    pixel_fraction_by_bin: dict = None,
+    current_albumin_value: float = None,
+) -> dict:
+    """Conservatively resolve provisional microalbumin ranges only with strong chart evidence."""
+    shade_guard = dict(shade_guard or {})
+    explanation = explain_microalbumin_range_reason(shade_guard)
+    result = {
+        "resolved": False,
+        "resolved_value_mg_l": None,
+        "action": None,
+        "reason": explanation["reason"],
+        "nearest_chart_bin": shade_guard.get("nearest_chart_bin"),
+        "nearest_chart_de": shade_guard.get("nearest_chart_de"),
+        "nearest_vs_second_margin": shade_guard.get("nearest_vs_second_margin"),
+        "pixel_support": None,
+        "thresholds": {
+            "de_max": MICRO_RANGE_EXACT_DE_MAX,
+            "margin_min": MICRO_RANGE_EXACT_MARGIN_MIN,
+            "pixel_support_min": MICRO_RANGE_EXACT_PIXEL_SUPPORT_MIN,
+        },
+    }
+    shade_guard["range_explanation"] = explanation
+
+    if shade_guard.get("report_mode") == "unconfirmed" or str(shade_guard.get("action", "")).startswith("unconfirmed") or shade_guard.get("overbright_ood_no_chart_support"):
+        result["reason"] = "unconfirmed_or_ood_not_resolved"
+        shade_guard["range_resolution"] = result
+        return shade_guard
+
+    range_tuple = shade_guard.get("provisional_albumin_range_mg_l")
+    if range_tuple is None:
+        result["reason"] = "no_provisional_range"
+        shade_guard["range_resolution"] = result
+        return shade_guard
+
+    low, high = float(range_tuple[0]), float(range_tuple[1])
+    nearest = shade_guard.get("nearest_chart_bin")
+    try:
+        nearest = None if nearest is None else float(nearest)
+    except (TypeError, ValueError):
+        nearest = None
+    if nearest is None:
+        result["reason"] = "missing_nearest_chart_bin"
+        shade_guard["range_resolution"] = result
+        return shade_guard
+
+    if median_de_by_bin is None:
+        median_de_by_bin = {}
+    if pixel_fraction_by_bin is None:
+        pixel_fraction_by_bin = {}
+    nearest_de = _mapping_value(median_de_by_bin, nearest)
+    if nearest_de is None:
+        nearest_de = shade_guard.get("nearest_chart_de")
+    nearest_de = None if nearest_de is None else float(nearest_de)
+    margin = shade_guard.get("nearest_vs_second_margin")
+    margin = None if margin is None else float(margin)
+    pixel_support = _mapping_value(pixel_fraction_by_bin, nearest)
+    result.update({
+        "nearest_chart_bin": nearest,
+        "nearest_chart_de": nearest_de,
+        "nearest_vs_second_margin": margin,
+        "pixel_support": pixel_support,
+    })
+
+    allowed = []
+    if (low, high) == (80.0, 150.0):
+        allowed = [80.0, 150.0]
+    elif (low, high) == (150.0, 400.0):
+        allowed = [150.0, 250.0, 400.0]
+    elif high <= 30.0:
+        selected_low = shade_guard.get("selected_low_bin")
+        clear_low = bool(shade_guard.get("low_bin_selection")) or selected_low in (3, 10, 30, 3.0, 10.0, 30.0)
+        allowed = [float(selected_low)] if clear_low and selected_low is not None else []
+    else:
+        allowed = [nearest] if low <= nearest <= high else []
+
+    if nearest not in allowed:
+        result["reason"] = "nearest_chart_bin_not_allowed_for_range"
+        shade_guard["range_resolution"] = result
+        return shade_guard
+    if nearest_de is None or nearest_de > MICRO_RANGE_EXACT_DE_MAX:
+        result["reason"] = "nearest_chart_de_too_high_or_missing"
+        shade_guard["range_resolution"] = result
+        return shade_guard
+    if margin is None or margin < MICRO_RANGE_EXACT_MARGIN_MIN:
+        result["reason"] = "nearest_vs_second_margin_too_small_or_missing"
+        shade_guard["range_resolution"] = result
+        return shade_guard
+    if pixel_support is not None and pixel_support < MICRO_RANGE_EXACT_PIXEL_SUPPORT_MIN:
+        result["reason"] = "pixel_support_too_low"
+        shade_guard["range_resolution"] = result
+        return shade_guard
+
+    resolved_value = float(nearest)
+    result.update({
+        "resolved": True,
+        "resolved_value_mg_l": resolved_value,
+        "action": "provisional_range_resolved_to_exact",
+        "reason": "strong_chart_evidence_supported_exact_bin",
+    })
+    shade_guard.update({
+        "report_mode": "guarded_exact",
+        "corrected_albumin_value": resolved_value,
+        "provisional_albumin_range_mg_l": None,
+        "action": "provisional_range_resolved_to_exact",
+        "guard_applied": current_albumin_value is None or float(current_albumin_value) != resolved_value,
+        "guard_reason": f"Provisional range resolved to {resolved_value:.0f} mg/L using strong chart evidence.",
+        "range_resolution": result,
+    })
+    return shade_guard
+
 def derive_microalbumin_guarded_uacr_scenario(
     shade_guard: dict,
     creatinine_mg_dl,
@@ -1515,6 +1871,17 @@ def choose_microalbumin_report_display(exact_value, shade_guard, guarded_scenari
         range_display = f"{range_tuple[0]:.0f}–{range_tuple[1]:.0f} mg/L"
 
     def _exact(prefix=""):
+        very_high = _microalbumin_very_high_payload(exact_value)
+        if very_high["triggered"]:
+            return {
+                "microalbumin_report_mode": MICRO_VERY_HIGH_DISPLAY_MODE,
+                "microalbumin_display_text": f"{float(exact_value):.0f} mg/L",
+                "microalbumin_exact_value_mg_l": float(exact_value),
+                "microalbumin_range_mg_l": None,
+                "microalbumin_range_display": None,
+                "retest_recommended": False,
+                "microalbumin_very_high_display": very_high,
+            }
         text = f"{prefix}{float(exact_value):.0f} mg/L"
         if action.startswith("strong_aqua_matched_") or action.startswith("strong_aqua_below_400_matched_"):
             text += ", aqua-confirmed"
@@ -1525,6 +1892,7 @@ def choose_microalbumin_report_display(exact_value, shade_guard, guarded_scenari
             "microalbumin_range_mg_l": None,
             "microalbumin_range_display": None,
             "retest_recommended": report_mode == "high_watch",
+            "microalbumin_very_high_display": very_high,
         }
 
     if report_mode == "provisional_range":
@@ -1535,6 +1903,7 @@ def choose_microalbumin_report_display(exact_value, shade_guard, guarded_scenari
             "microalbumin_range_mg_l": tuple(range_tuple) if range_tuple is not None else None,
             "microalbumin_range_display": range_display,
             "retest_recommended": True,
+            "microalbumin_very_high_display": _microalbumin_very_high_payload(None),
         }
     if report_mode == "unconfirmed" or exact_value is None:
         return {
@@ -1544,10 +1913,22 @@ def choose_microalbumin_report_display(exact_value, shade_guard, guarded_scenari
             "microalbumin_range_mg_l": None,
             "microalbumin_range_display": None,
             "retest_recommended": True,
+            "microalbumin_very_high_display": _microalbumin_very_high_payload(None),
         }
     if report_mode == "guarded_exact":
         return _exact(prefix="Guarded ")
     if report_mode == "high_watch":
+        very_high = _microalbumin_very_high_payload(exact_value)
+        if very_high["triggered"]:
+            return {
+                "microalbumin_report_mode": MICRO_VERY_HIGH_DISPLAY_MODE,
+                "microalbumin_display_text": f"{float(exact_value):.0f} mg/L",
+                "microalbumin_exact_value_mg_l": float(exact_value),
+                "microalbumin_range_mg_l": None,
+                "microalbumin_range_display": None,
+                "retest_recommended": False,
+                "microalbumin_very_high_display": very_high,
+            }
         return {
             "microalbumin_report_mode": "high_watch",
             "microalbumin_display_text": f"High-watch {float(exact_value):.0f} mg/L / retest recommended",
@@ -1555,6 +1936,7 @@ def choose_microalbumin_report_display(exact_value, shade_guard, guarded_scenari
             "microalbumin_range_mg_l": None,
             "microalbumin_range_display": None,
             "retest_recommended": True,
+            "microalbumin_very_high_display": very_high,
         }
     return _exact()
 
@@ -2406,6 +2788,41 @@ def process_image_and_get_pods(image_path, model, device):
     pod1_eroded = eroded_mask(pod1_mask)
     pod2_eroded = eroded_mask(pod2_mask)
 
+    segmentation_artifact_info = None
+    if SEGMENTATION_ARTIFACTS_ENABLED:
+        try:
+            artifact_request_id = uuid.uuid4().hex
+            artifact_dir = create_segmentation_artifact_dir(
+                SEGMENTATION_ARTIFACT_ROOT,
+                request_id=artifact_request_id,
+                image_name=os.path.basename(image_path),
+            )
+            segmentation_artifact_info = save_segmentation_artifacts(
+                artifact_dir,
+                raw_image_np=raw_np,
+                wb_image_np=wb_np,
+                pred_mask_original_size=mask,
+                pred_mask_model_size=preds,
+                pod1_mask=pod1_mask,
+                pod2_mask=pod2_mask,
+                class_labels={POD1_IDX: "pod1_creatinine", POD2_IDX: "pod2_microalbumin"},
+                metadata={
+                    "request_id": artifact_request_id,
+                    "image_name": os.path.basename(image_path),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "model_path": getattr(model, "_c", None).__class__.__name__ if getattr(model, "_c", None) is not None else str(model.__class__.__name__),
+                    "model_input_size": [256, 256],
+                    "pod1_class_index": POD1_IDX,
+                    "pod2_class_index": POD2_IDX,
+                },
+            )
+        except Exception as exc:
+            logging.error("Failed to save segmentation artifacts: %s", exc, exc_info=True)
+            segmentation_artifact_info = {
+                "database_export_ready": False,
+                "error": str(exc),
+            }
+
     pod1_mask_quality = _compute_mask_quality(pod1_mask, raw_np.shape[:2], QUALITY_THRESHOLDS)
     pod2_mask_quality = _compute_mask_quality(pod2_mask, raw_np.shape[:2], QUALITY_THRESHOLDS)
     pod1_metrics = _compute_quality_metrics(wb_np, pod1_eroded)
@@ -2437,6 +2854,25 @@ def process_image_and_get_pods(image_path, model, device):
         allow_unconfirmed=True,
         creatinine_mg_dl=c1_snapped,
     )
+    albumin_shade_guard = resolve_microalbumin_range_to_exact_if_supported(
+        albumin_shade_guard,
+        median_de_by_bin={
+            3: albumin_shade_guard.get("median_de_3"),
+            10: albumin_shade_guard.get("median_de_10"),
+            30: albumin_shade_guard.get("median_de_30"),
+            80: albumin_shade_guard.get("median_de_80"),
+            150: albumin_shade_guard.get("median_de_150"),
+            albumin_shade_guard.get("nearest_chart_bin"): albumin_shade_guard.get("nearest_chart_de"),
+        },
+        pixel_fraction_by_bin={
+            3: (albumin_shade_guard.get("low_pixel_fraction_by_class") or {}).get("3"),
+            10: (albumin_shade_guard.get("low_pixel_fraction_by_class") or {}).get("10"),
+            30: (albumin_shade_guard.get("low_pixel_fraction_by_class") or {}).get("30"),
+            80: albumin_shade_guard.get("aqua_pixel_fraction"),
+            150: albumin_shade_guard.get("aqua_pixel_fraction"),
+        },
+        current_albumin_value=c2_snapped,
+    )
     albumin_guarded_scenario = derive_microalbumin_guarded_uacr_scenario(
         shade_guard=albumin_shade_guard,
         creatinine_mg_dl=c1_snapped,
@@ -2452,12 +2888,24 @@ def process_image_and_get_pods(image_path, model, device):
     c2_report_mode = microalbumin_report_display["microalbumin_report_mode"]
     c2_display_text = microalbumin_report_display["microalbumin_display_text"]
     c2_range = microalbumin_report_display["microalbumin_range_mg_l"]
+    microalbumin_very_high_display = microalbumin_report_display.get(
+        "microalbumin_very_high_display",
+        _microalbumin_very_high_payload(c2_final_exact),
+    )
+    if not microalbumin_very_high_display.get("triggered"):
+        microalbumin_very_high_display = _microalbumin_very_high_payload(c2_snapped)
+    if microalbumin_very_high_display.get("triggered"):
+        c2_final_exact = microalbumin_very_high_display["display_value_mg_l"]
+        c2_report_mode = MICRO_VERY_HIGH_DISPLAY_MODE
+        c2_display_text = f"{float(c2_final_exact):.0f} mg/L"
+        c2_range = None
 
     microalbumin_report_mode_before_legacy_recovery = c2_report_mode
     final_display_value_before_legacy_recovery = c2_final_exact
     legacy_recovery_attempted = bool(
         ENABLE_MICROALBUMIN_UNCONFIRMED_LEGACY_RECOVERY
         and albumin_shade_guard.get("report_mode") == "unconfirmed"
+        and not microalbumin_very_high_display.get("triggered")
     )
     legacy_recovery_result = None
     if legacy_recovery_attempted:
@@ -2490,15 +2938,17 @@ def process_image_and_get_pods(image_path, model, device):
     guarded_albumin_range_mg_l = None
     if microalbumin_report_mode_before_legacy_recovery in ("exact", "guarded_exact"):
         uacr_report_mode_before_legacy_recovery = "exact"
+    elif microalbumin_report_mode_before_legacy_recovery == MICRO_VERY_HIGH_DISPLAY_MODE:
+        uacr_report_mode_before_legacy_recovery = MICRO_VERY_HIGH_DISPLAY_MODE
     elif microalbumin_report_mode_before_legacy_recovery == "high_watch":
         uacr_report_mode_before_legacy_recovery = "high_watch"
     elif microalbumin_report_mode_before_legacy_recovery == "provisional_range":
         uacr_report_mode_before_legacy_recovery = "provisional_range"
     else:
         uacr_report_mode_before_legacy_recovery = "unconfirmed"
-    if c2_report_mode in ("exact", "guarded_exact") and c2_final_exact is not None:
+    if c2_report_mode in ("exact", "guarded_exact", MICRO_VERY_HIGH_DISPLAY_MODE) and c2_final_exact is not None:
         uacr_value, uacr_stage, uacr_range, uacr_display = calculate_uacr_and_category(c2_final_exact, c1_snapped)
-        c2_report_mode_for_uacr = "exact"
+        c2_report_mode_for_uacr = MICRO_VERY_HIGH_DISPLAY_MODE if c2_report_mode == MICRO_VERY_HIGH_DISPLAY_MODE else "exact"
     elif c2_report_mode == "high_watch" and c2_final_exact is not None:
         uacr_value, uacr_stage, uacr_range, exact_uacr_display = calculate_uacr_and_category(c2_final_exact, c1_snapped)
         uacr_display = f"{exact_uacr_display} (High-watch / retest recommended)"
@@ -2548,7 +2998,7 @@ def process_image_and_get_pods(image_path, model, device):
     microalbumin_si = convert_microalbumin_to_si(c2_final_exact) if c2_final_exact is not None else None
     acr_si = None
     acr_si_range = None
-    if c2_report_mode_for_uacr in ("exact", "guarded_exact", "high_watch", "legacy_recovered") and c2_final_exact is not None:
+    if c2_report_mode_for_uacr in ("exact", "guarded_exact", "high_watch", "legacy_recovered", MICRO_VERY_HIGH_DISPLAY_MODE) and c2_final_exact is not None:
         acr_si = calculate_acr_si(c2_final_exact, c1_snapped)
     elif c2_report_mode_for_uacr == "provisional_range":
         acr_si = _unconfirmed_acr_si()
@@ -2635,6 +3085,8 @@ def process_image_and_get_pods(image_path, model, device):
     return {
         'composite_img': fname,
         'unit_systems': unit_systems,
+        'segmentation_artifacts': segmentation_artifact_info,
+        'microalbumin_very_high_display': microalbumin_very_high_display,
         'creatinine_si': creatinine_si,
         'microalbumin_si': microalbumin_si,
         'acr_si': acr_si,
@@ -2648,7 +3100,7 @@ def process_image_and_get_pods(image_path, model, device):
         'uacr_display': uacr_display,
         'uacr_guarded_range_mg_g': guarded_uacr_range_mg_g,
         'uacr_guarded_albumin_range_mg_l': guarded_albumin_range_mg_l,
-        'uacr_retest_recommended': bool(microalbumin_report_display["retest_recommended"]),
+        'uacr_retest_recommended': bool(microalbumin_report_display["retest_recommended"]) and not microalbumin_very_high_display.get("triggered"),
         'uacr_warning': 'Microalbumin is high-watch; retest recommended.' if c2_report_mode_for_uacr == 'high_watch' else None,
         'uacr_reporting_note': 'Provisional UACR ranges are triage-only and require retest when exact microalbumin is not finalized.',
         'uacr_report_mode_before_legacy_recovery': uacr_report_mode_before_legacy_recovery,
@@ -2663,7 +3115,7 @@ def process_image_and_get_pods(image_path, model, device):
         'uacr_legacy_trace': build_uacr_trace(c2, c1, uacr_legacy_value, 'legacy_calibrated_continuous'),
         'uacr_corrected_trace': (
             build_uacr_trace(c2_final_exact, c1_snapped, uacr_value, 'corrected_exact_with_microalbumin_shade_guard')
-            if c2_report_mode_for_uacr in ("exact", "high_watch") else
+            if c2_report_mode_for_uacr in ("exact", "high_watch", MICRO_VERY_HIGH_DISPLAY_MODE) else
             {
                 "trace_type": "legacy_recovered_after_v4_unconfirmed",
                 "albumin_value": c2_final_exact,
@@ -2733,7 +3185,10 @@ def process_image_and_get_pods(image_path, model, device):
                 'microalbumin_report_mode_before_legacy_recovery': microalbumin_report_mode_before_legacy_recovery,
                 'microalbumin_report_mode_after_legacy_recovery': microalbumin_report_mode_after_legacy_recovery,
                 'microalbumin_report_range_mg_l': c2_range,
-                'retest_recommended': microalbumin_report_display["retest_recommended"],
+                'retest_recommended': bool(microalbumin_report_display["retest_recommended"]) and not microalbumin_very_high_display.get("triggered"),
+                'microalbumin_very_high_display': microalbumin_very_high_display,
+                'range_explanation': albumin_shade_guard.get('range_explanation'),
+                'range_resolution': albumin_shade_guard.get('range_resolution'),
                 'reporting_note': 'Exact microalbumin value is not finalized when guard evidence is unconfirmed or ambiguous; a provisional range is shown for A1/A2 triage only.',
             },
         },
